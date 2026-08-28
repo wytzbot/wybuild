@@ -1,0 +1,2 @@
+export const buildChangeSet=(base,current)=>{const keys=new Set([...Object.keys(base),...Object.keys(current)]);return [...keys].flatMap(path=>base[path]===current[path]?[]:[{path,status:!(path in base)?"A":!(path in current)?"D":"M",content:current[path]}])};
+export const renameFolder=(files,from,to)=>Object.fromEntries(Object.entries(files).map(([p,v])=>[p===from||p.startsWith(from+"/")?to+p.slice(from.length):p,v]));

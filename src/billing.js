@@ -1,0 +1,3 @@
+import {API_BASE_URL} from "./config";
+const call=(p,o={})=>fetch(`${API_BASE_URL}${p}`,{credentials:"include",headers:{"Content-Type":"application/json",...(o.headers||{})},...o}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||"Billing request failed");return d});
+export const billing={status:()=>call("/billing/status"),config:()=>call("/billing/config"),checkout:p=>call("/billing/checkout",{method:"POST",body:JSON.stringify(p)}),verify:p=>call("/billing/verify",{method:"POST",body:JSON.stringify(p)}),authorize:p=>call("/billing/authorize",{method:"POST",body:JSON.stringify(p)}),resolve:p=>call("/billing/resolve",{method:"POST",body:JSON.stringify(p)}),recover:p=>call("/billing/recover",{method:"POST",body:JSON.stringify({reference:p||""})})};

@@ -1,0 +1,2 @@
+import {Github} from "lucide-react";import {github} from "../github";
+export default function Login(){return <main className="login"><div className="loginBox"><div className="brand">WYDEV</div><h1>Code on the move.</h1><p>Edit, organize, diagnose and push GitHub projects from your phone.</p><button className="primary wide" onClick={github.login}><Github size={19}/>Continue with GitHub</button><small>GitHub is the source of truth. WyDev does not host your repositories.</small></div></main>}

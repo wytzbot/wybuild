@@ -1,0 +1,1 @@
+export const searchFiles=(files,q)=>{if(!q)return[];const needle=q.toLowerCase();return Object.entries(files).flatMap(([path,text])=>String(text).split("\n").map((line,i)=>line.toLowerCase().includes(needle)?{path,line:i+1,text:line.trim()}:null).filter(Boolean))};

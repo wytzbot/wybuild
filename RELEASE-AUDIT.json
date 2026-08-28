@@ -1,0 +1,22 @@
+{
+  "name": "WyDev",
+  "release": "production-hardened-final",
+  "date": "2026-08-26",
+  "vercel_serverless_functions": 1,
+  "github_source_of_truth": true,
+  "firebase_persistence": true,
+  "flutterwave_v4": true,
+  "ai_diagnosis_only": true,
+  "frontend_secret_scan": "PASS",
+  "source_checks": "PASS",
+  "vite_build": "NOT_VERIFIABLE_IN_SANDBOX",
+  "notes": [
+    "Vite executable in this sandbox returns Permission denied.",
+    "Run npm ci && npm run build:source in Vercel/CI to validate the production bundle."
+  ],
+  "pro_pricing": {
+    "NGN": 9000,
+    "USD": 9.99
+  },
+  "nigerian_default_currency": "NGN"
+}
