@@ -20,9 +20,11 @@ The selected repository must contain an Android Gradle project (`gradlew`). If t
 
 WyBuild does not silently modify the default branch.
 
+Installing the workflow only writes the file once. If the embedded workflow template (`WORKFLOW` in `api/index.js`) is later updated - for example to bump Actions versions - repositories that installed it earlier keep running their original copy. `GET /api/github/workflow` reports `upToDate`/`installedVersion`/`currentVersion` (based on a `wybuild-workflow-version` marker embedded in the file) so the UI can prompt a reinstall when a repo is behind.
+
 ## Local setup
 
-1. Install Node 20.19+.
+1. Install Node 24.x (matches the `engines` field in `package.json`).
 2. Run `npm install`.
 3. Copy `.env.example` to `.env`.
 4. Fill in the GitHub OAuth and session variables.
@@ -43,7 +45,7 @@ Use the repository root as the Vercel project root. Vercel should detect Vite au
 
 - Build command: `npm run build`
 - Output directory: `dist`
-- Node.js: 20.19+ (the package declares the engine requirement)
+- Node.js: 24.x (the package declares the engine requirement; Vercel disables Node.js 20 for Builds and Functions on October 1, 2026, so set the project's Node.js version to 24.x in Project Settings if it isn't already)
 
 The API is consolidated in `api/index.js`; do not add a separate Vercel function for every endpoint.
 

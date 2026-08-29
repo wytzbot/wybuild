@@ -26,6 +26,9 @@ export const githubLogout = () => api('/api/auth/logout', { method: 'POST' });
 export async function getSession() { const d = await api('/api/auth/me'); return d?.authenticated === true ? d : null; }
 export const listRepositories = () => api('/api/github/repos');
 export const listBranches = (owner, repo) => api(`/api/github/branches?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`);
+// Resolves to { exists, dispatchable, upToDate, installedVersion, currentVersion }.
+// upToDate is null when no workflow is installed yet; false means the installed
+// copy predates the current WyBuild workflow template and should be reinstalled.
 export const checkWorkflow = (owner, repo, ref) => api(`/api/github/workflow?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&ref=${encodeURIComponent(ref)}`);
 export const installWorkflow = (owner, repo, ref) => api('/api/github/install-workflow', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner,repo,ref}) });
 export const dispatchBuild = payload => api('/api/github/dispatch', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });

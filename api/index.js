@@ -225,7 +225,14 @@ async function countMonthlyBuilds(s) {
   return count;
 }
 
-const WORKFLOW = `name: WyBuild
+// Bump this whenever WORKFLOW's content changes materially (action versions,
+// validation logic, build steps, etc). It's embedded as a YAML comment in the
+// installed file so /api/github/workflow can tell an already-installed repo
+// apart from one running an older generation of the template.
+const WORKFLOW_VERSION = 2;
+
+const WORKFLOW = `# wybuild-workflow-version: ${WORKFLOW_VERSION}
+name: WyBuild
 on:
   workflow_dispatch:
     inputs:
@@ -259,7 +266,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Find Android Gradle project
         id: project
@@ -315,7 +322,7 @@ jobs:
 
       - name: Upload APK
         if: inputs.build_type == 'apk'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: wybuild-apk-\${{ github.run_number }}
           path: '\${{ steps.project.outputs.project_dir }}/**/build/outputs/apk/**/*.apk'
@@ -324,7 +331,7 @@ jobs:
 
       - name: Upload AAB
         if: inputs.build_type == 'aab'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: wybuild-aab-\${{ github.run_number }}
           path: '\${{ steps.project.outputs.project_dir }}/**/build/outputs/bundle/**/*.aab'
@@ -450,9 +457,20 @@ export default async function handler(req, res) {
       const ref = safePart(u.searchParams.get('ref'), 'ref');
 
       let exists = false;
+      let upToDate = null;
+      let installedVersion = null;
       try {
-        await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, s.token);
+        const file = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, s.token);
         exists = true;
+        try {
+          const content = Buffer.from(file.content || '', 'base64').toString('utf8');
+          const match = content.match(/^#\s*wybuild-workflow-version:\s*(\d+)/m);
+          installedVersion = match ? Number(match[1]) : 0;
+          upToDate = installedVersion >= WORKFLOW_VERSION;
+        } catch {
+          // Couldn't parse the file (unexpected format) - treat as needing a refresh.
+          upToDate = false;
+        }
       } catch (e) {
         if (e.status !== 404) throw e;
       }
@@ -470,7 +488,7 @@ export default async function handler(req, res) {
         dispatchable = workflows.some(w => w.path === '.github/workflows/wybuild.yml' && w.state === 'active');
       } catch { /* leave dispatchable false; UI will prompt to install/merge */ }
 
-      return json(res, 200, { exists, dispatchable });
+      return json(res, 200, { exists, dispatchable, upToDate, installedVersion, currentVersion: WORKFLOW_VERSION });
     }
 
 
