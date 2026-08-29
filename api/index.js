@@ -232,49 +232,105 @@ on:
       build_type:
         description: APK or AAB
         required: true
+        type: choice
+        options:
+          - apk
+          - aab
         default: apk
       build_mode:
         description: debug or release
         required: true
+        type: choice
+        options:
+          - debug
+          - release
         default: debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wybuild-\${{ github.repository }}-\${{ github.ref }}-\${{ inputs.build_type }}-\${{ inputs.build_mode }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Validate project
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Find Android Gradle project
+        id: project
+        shell: bash
         run: |
-          if [ ! -f ./gradlew ]; then
-            echo "::error::No gradlew found. WyBuild requires a repository with a configured Android Gradle project."
+          set -euo pipefail
+          wrapper="$(find . -type f -name gradlew -not -path './.git/*' -not -path '*/node_modules/*' | head -n 1 || true)"
+          if [ -z "$wrapper" ]; then
+            echo "::error title=Android Gradle project not found::No gradlew wrapper was found. WyBuild expects an Android/Gradle project with its Gradle wrapper committed to Git."
+            echo "::error::If this is a Flutter project, add the Flutter build support to your project or use an Android Gradle project."
             exit 1
           fi
-          chmod +x ./gradlew
+          project_dir="$(dirname "$wrapper")"
+          project_dir="\${project_dir#./}"
+          if [ "$project_dir" = "." ]; then project_dir="."; fi
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Using Gradle project: $project_dir"
+          chmod +x "$wrapper"
+
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
+
+      - name: Verify Gradle wrapper
+        working-directory: \${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --version
+
       - name: Build APK
         if: inputs.build_type == 'apk'
-        run: ./gradlew assemble\${{ inputs.build_mode == 'release' && 'Release' || 'Debug' }} --no-daemon
+        working-directory: \${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "\${{ inputs.build_mode }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          fi
+
       - name: Build AAB
         if: inputs.build_type == 'aab'
-        run: ./gradlew bundleRelease --no-daemon
+        working-directory: \${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew bundleRelease --no-daemon --stacktrace
+
       - name: Upload APK
         if: inputs.build_type == 'apk'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: wybuild-apk
-          path: '**/build/outputs/apk/**/*.apk'
+          name: wybuild-apk-\${{ github.run_number }}
+          path: '\${{ steps.project.outputs.project_dir }}/**/build/outputs/apk/**/*.apk'
           if-no-files-found: error
+          retention-days: 7
+
       - name: Upload AAB
         if: inputs.build_type == 'aab'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: wybuild-aab
-          path: '**/build/outputs/bundle/**/*.aab'
-          if-no-files-found: error`;
+          name: wybuild-aab-\${{ github.run_number }}
+          path: '\${{ steps.project.outputs.project_dir }}/**/build/outputs/bundle/**/*.aab'
+          if-no-files-found: error
+          retention-days: 7
+`;
 
 export default async function handler(req, res) {
   try {

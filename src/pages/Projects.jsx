@@ -12,7 +12,7 @@ export default function Projects({session,onLogin}){
 
   const build=async()=>{setLoading(true);setMsg('');setError('');try{await dispatchBuild({owner:repo.owner.login,repo:repo.name,ref:branch,inputs:{build_type:PRESETS[preset].build_type,build_mode:PRESETS[preset].build_mode}});setMsg('Build queued in GitHub Actions. Open Builds to monitor the real run.')}catch(e){setError(e.message);refreshWorkflow()}finally{setLoading(false)}};
 
-  const doInstall=async()=>{setInstalling(true);setError('');try{const x=await installWorkflow(repo.owner.login,repo.name,branch);setMsg(x.message);setInstall(x);if(x.merged){setBranch(x.branch);setBranches(v=>[...v,{name:x.branch}]);setWorkflow({exists:true,dispatchable:true})}else{refreshWorkflow()}}catch(e){setError(e.message)}finally{setInstalling(false)}};
+  const doInstall=async()=>{setInstalling(true);setError('');try{const x=await installWorkflow(repo.owner.login,repo.name,branch);setMsg(x.message);setInstall(x);if(x.merged){setWorkflow({exists:true,dispatchable:true});setInstall(null);setMsg(x.message||'Workflow installed. The selected branch can now be built.')}else{refreshWorkflow()}}catch(e){setError(e.message)}finally{setInstalling(false)}};
 
   const ready=workflow?.dispatchable===true;
 
