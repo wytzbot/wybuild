@@ -1,6 +1,6 @@
 import React,{useEffect,useState} from 'react';import {githubLogin,listRepositories,listBranches,checkWorkflow,installWorkflow,dispatchBuild} from '../github';import {PRESETS} from '../builds';
 export default function Projects({session,onLogin}){
-  const[repos,setRepos]=useState([]),[repoError,setRepoError]=useState(''),[branches,setBranches]=useState([]),[repo,setRepo]=useState(null),[branch,setBranch]=useState(''),[preset,setPreset]=useState('quick_apk'),[loading,setLoading]=useState(false),[installing,setInstalling]=useState(false),[checking,setChecking]=useState(false),[workflow,setWorkflow]=useState(null),[install,setInstall]=useState(null),[msg,setMsg]=useState(''),[error,setError]=useState('');
+  const[repos,setRepos]=useState([]),[repoError,setRepoError]=useState(''),[branches,setBranches]=useState([]),[repo,setRepo]=useState(null),[branch,setBranch]=useState(''),[preset,setPreset]=useState('auto'),[loading,setLoading]=useState(false),[installing,setInstalling]=useState(false),[checking,setChecking]=useState(false),[workflow,setWorkflow]=useState(null),[install,setInstall]=useState(null),[msg,setMsg]=useState(''),[error,setError]=useState('');
 
   useEffect(()=>{if(session){setRepoError('');listRepositories().then(setRepos).catch(e=>{setRepoError(e.message);setError(e.message)})}},[session]);
   useEffect(()=>{if(!repo)return;listBranches(repo.owner.login,repo.name).then(x=>{setBranches(x);setBranch(repo.default_branch)}).catch(e=>setError(e.message))},[repo]);
@@ -12,11 +12,11 @@ export default function Projects({session,onLogin}){
 
   const build=async()=>{setLoading(true);setMsg('');setError('');try{await dispatchBuild({owner:repo.owner.login,repo:repo.name,ref:branch,inputs:{build_type:PRESETS[preset].build_type,build_mode:PRESETS[preset].build_mode}});setMsg('Build queued in GitHub Actions. Open Builds to monitor the real run.')}catch(e){setError(e.message);refreshWorkflow()}finally{setLoading(false)}};
 
-  const doInstall=async()=>{setInstalling(true);setError('');try{const x=await installWorkflow(repo.owner.login,repo.name,branch);setMsg(x.message);setInstall(x);if(x.merged){setWorkflow({exists:true,dispatchable:true});setInstall(null);setMsg(x.message||'Workflow installed. The selected branch can now be built.')}else{refreshWorkflow()}}catch(e){setError(e.message)}finally{setInstalling(false)}};
+  const doInstall=async()=>{setInstalling(true);setError('');try{const x=await installWorkflow(repo.owner.login,repo.name,branch);setMsg(x.message);setInstall(x);if(x.merged){setInstall(null);setMsg(x.message||'Workflow installed. Checking the latest workflow…');setTimeout(refreshWorkflow,300)}else{refreshWorkflow()}}catch(e){setError(e.message)}finally{setInstalling(false)}};
 
-  const ready=workflow?.dispatchable===true;
+  const ready=workflow?.dispatchable===true && workflow?.upToDate!==false;
 
-  return <div className="page"><div className="eyebrow">WORKSPACE</div><h1 className="title">Projects</h1><p className="sub">Select a repository and run a real GitHub Actions build.</p>
+  return <div className="page"><div className="eyebrow">WORKSPACE</div><h1 className="title">Projects</h1><p className="sub">Select a repository and build Flutter, Android/Gradle, React, Vite, Next.js or vanilla web projects with GitHub Actions.</p>
     {repoError&&<div className="notice error">{repoError}<button className="btn secondary" onClick={()=>listRepositories().then(setRepos).catch(e=>setRepoError(e.message))}>Retry repositories</button></div>}
     {msg&&<div className="notice">{msg}</div>}
     {error&&<div className="notice error">{error}</div>}
@@ -29,9 +29,11 @@ export default function Projects({session,onLogin}){
             ? '✓ WyBuild workflow detected and ready to build.'
             : (install?.prUrl
                 ? <>Workflow committed - merge <a href={install.prUrl} target="_blank" rel="noreferrer">this pull request</a> into {install.defaultBranch} before building. GitHub only allows manual builds for workflows on the default branch.</>
-                : (workflow.exists
-                    ? 'Workflow file found on this branch, but GitHub has not registered it yet - it needs to be merged into the default branch before it can be triggered.'
-                    : 'WyBuild workflow is not installed on this branch.'))}
+                : (workflow.dispatchable && workflow.upToDate===false
+                    ? 'WyBuild is installed but outdated. Update it to enable the latest multi-stack build support.'
+                    : (workflow.exists
+                        ? 'Workflow file found, but GitHub has not registered it on the default branch yet. Merge the workflow PR into the default branch before building.'
+                        : 'WyBuild workflow is not installed. Install it once; after it reaches the default branch, any selected branch can be built.')))}
           {!ready&&!install?.prUrl&&<button className="btn secondary" disabled={installing} onClick={doInstall}>{installing?'Installing…':'Install workflow'}</button>}
           {!ready&&install?.prUrl&&<button className="btn secondary" disabled={checking} onClick={refreshWorkflow}>{checking?'Checking…':"I've merged it - check again"}</button>}
         </div>}

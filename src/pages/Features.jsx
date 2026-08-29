@@ -2,6 +2,24 @@ import React from 'react';
 
 const features = [
   {
+    title: 'Automatic project detection',
+    icon: '🧠',
+    summary: 'Detect Flutter, Android/Gradle, Next.js, Vite/React, Node web and vanilla HTML projects.',
+    how: 'The GitHub workflow inspects the repository for pubspec.yaml, Gradle wrappers, package.json and HTML entry files, then selects the matching build toolchain. You can also explicitly choose APK, AAB or Web.'
+  },
+  {
+    title: 'Flutter APK & AAB builds',
+    icon: '🦋',
+    summary: 'Build modern Flutter Android projects directly from GitHub.',
+    how: 'WyBuild installs a stable Flutter SDK, runs flutter pub get, then uses flutter build apk or flutter build appbundle. Current Flutter projects using the recommended Gradle Plugin DSL are supported.'
+  },
+  {
+    title: 'Web project builds',
+    icon: '💻',
+    summary: 'Build Vite, React, Next.js, Node-based and plain HTML projects.',
+    how: 'Node projects use the repository lockfile/package manager and npm run build when available. Next.js output is packaged separately, while Vite/React builds package dist/build output. Plain HTML projects are packaged without requiring Node.'
+  },
+  {
     title: 'Android APK generation',
     icon: '📦',
     summary: 'Turn a compatible Android project into an installable APK.',
@@ -16,20 +34,20 @@ const features = [
   {
     title: 'App icon',
     icon: '🖼️',
-    summary: 'Use the project artwork for the installed app where the Android template supports it.',
-    how: 'Icon assets are placed into the Android resources/template and referenced by the application manifest.'
+    summary: 'Preserve the project's existing Android icon configuration during the build.',
+    how: 'WyBuild does not invent an icon. It builds the repository as supplied, so an existing Android icon/resource configuration is retained by Gradle or Flutter.'
   },
   {
     title: 'Splash screen',
     icon: '✨',
-    summary: 'Give the Android wrapper a proper startup experience.',
-    how: 'The Android wrapper can display its configured launch screen while the web application is loading.'
+    summary: 'Preserve the project's existing Android/Flutter launch-screen configuration.',
+    how: 'WyBuild builds the existing project configuration. If the Android or Flutter project already defines a splash/launch screen, the generated app uses that configuration.'
   },
   {
     title: 'WebView / PWA wrapper',
     icon: '🌐',
-    summary: 'Package a compatible web app inside an Android application.',
-    how: 'The Android shell loads the web application in a WebView. Web functionality still depends on the original site, APIs, browser support and network availability.'
+    summary: 'Build web projects directly, or build an existing Android wrapper project.',
+    how: 'For Vite, React, Next.js and vanilla projects, WyBuild runs the project build and uploads the web output. For Android projects, WyBuild builds the Android project as-is; it does not secretly convert a website into a WebView app.'
   },
   {
     title: 'Internet permission',
@@ -38,28 +56,28 @@ const features = [
     how: 'The Android manifest includes the network permission required for an online WebView application.'
   },
   {
-    title: 'Android back-button handling',
+    title: 'Existing Android behavior',
     icon: '↩️',
-    summary: 'Make the Android back button behave more naturally in the web app.',
-    how: 'The wrapper can navigate backward through WebView history before exiting when there is no page history left.'
+    summary: 'Keep the repository's existing Android navigation behavior intact.',
+    how: 'WyBuild does not inject navigation code. Any back-button/WebView behavior comes from the project being built.'
   },
   {
     title: 'Loading & error handling',
     icon: '🛟',
-    summary: 'Avoid confusing blank screens when loading fails.',
-    how: 'The wrapper can detect loading/network failures and show an error state instead of silently leaving the user with a blank page.'
+    summary: 'Expose build and packaging failures instead of hiding them.',
+    how: 'GitHub Actions stops on failed commands and exposes the original logs, so dependency, compiler, Gradle, Flutter and packaging failures can be diagnosed directly.'
   },
   {
     title: 'GitHub Actions automation',
     icon: '⚙️',
     summary: 'Builds happen in GitHub instead of on the user's phone or computer.',
-    how: 'WyBuild installs the appropriate workflow into the selected repository. GitHub Actions checks out the project, prepares Java/Gradle and runs the Android build.'
+    how: 'WyBuild installs the appropriate workflow into the selected repository. GitHub Actions checks out the project, detects the technology, prepares Java/Flutter/Node as needed, builds it and uploads the correct artifact.'
   },
   {
-    title: 'Gradle & project validation',
+    title: 'Multi-stack project validation',
     icon: '🔍',
-    summary: 'Catch common project setup problems before they become mysterious failures.',
-    how: 'The workflow checks for the Gradle wrapper and reports useful diagnostics for missing wrappers, dependencies, SDK components, manifest errors and other build failures.'
+    summary: 'Catch common setup problems across Android, Flutter and web projects before they become mysterious failures.',
+    how: 'The workflow checks for the expected project markers and reports useful diagnostics for missing wrappers, dependencies, SDK components, package-manager lockfiles, build scripts and other build failures.'
   },
   {
     title: 'APK build artifacts',

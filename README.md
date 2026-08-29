@@ -1,3 +1,18 @@
+
+## Supported project types
+
+WyBuild now uses one workflow for multiple stacks:
+
+- **Flutter** — `flutter pub get`, APK and AAB builds.
+- **Android/Gradle** — Gradle wrapper based APK/AAB builds, including nested Android projects.
+- **React/Vite/Node web** — installs npm/pnpm/yarn dependencies and runs the project build script.
+- **Next.js** — runs the Next build and packages the generated `.next` output.
+- **Vanilla HTML/CSS/JS** — packages the static site without requiring Node.
+
+Use **Auto Detect** when you want WyBuild to choose the appropriate toolchain. Use **Web** when you specifically want web output.
+
+GitHub's `workflow_dispatch` API requires the workflow to be present on the repository's default branch before manual dispatch is available, so workflow installation may create a pull request when branch protection prevents an automatic merge.
+
 # WyBuild
 
 WyBuild is a GitHub-powered Android build and release interface. It keeps source code in GitHub and runs builds in GitHub Actions; Vercel hosts the web/API layer.
