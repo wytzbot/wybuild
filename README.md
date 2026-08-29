@@ -49,7 +49,7 @@ The API is consolidated in `api/index.js`; do not add a separate Vercel function
 
 ## WyDev billing
 
-WyDev is the only Flutterwave billing authority. WyBuild does not initialize Flutterwave transactions, verify Flutterwave transactions, or receive a Flutterwave webhook. It only reads the server-confirmed entitlement exposed by WyDev.
+WyDev is the only Flutterwave billing authority. WyBuild does not initialize Flutterwave transactions, verify Flutterwave transactions, or receive a Flutterwave webhook. It reads the server-confirmed entitlement exposed by WyDev and enforces the monthly build limit server-side by counting real WyBuild GitHub Actions runs for the current UTC month. This means the limit is enforced even when the frontend is bypassed. For a fully atomic cross-instance quota reservation, a future WyDev billing service can expose a reservation/consume endpoint; the current implementation remains safe against normal client-side bypasses.
 
 ## Security
 

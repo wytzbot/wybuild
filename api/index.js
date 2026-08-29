@@ -1,20 +1,231 @@
 import crypto from 'node:crypto';
 
-const COOKIE='wybuild_session', STATE_COOKIE='wybuild_oauth_state', GH='https://api.github.com';
-const json=(res,status,body)=>{res.statusCode=status;res.setHeader('Content-Type','application/json');res.end(JSON.stringify(body));};
-const urlOf=req=>new URL(req.url,`http://${req.headers.host}`);
-async function body(req){let s='';for await(const c of req)s+=c;if(!s)return{};try{return JSON.parse(s)}catch{throw Object.assign(new Error('Invalid JSON body'),{status:400})}}
-function key(){return crypto.createHash('sha256').update(process.env.SESSION_SECRET||'development-only-change-me').digest()}
-function seal(obj){const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',key(),iv);const raw=Buffer.from(JSON.stringify({...obj,exp:Date.now()+7*86400000}));const enc=Buffer.concat([cipher.update(raw),cipher.final()]);return [iv,cipher.getAuthTag(),enc].map(x=>x.toString('base64url')).join('.')}
-function unseal(v){try{const[a,b,c]=v.split('.');const d=crypto.createDecipheriv('aes-256-gcm',key(),Buffer.from(a,'base64url'));d.setAuthTag(Buffer.from(b,'base64url'));const x=JSON.parse(Buffer.concat([d.update(Buffer.from(c,'base64url')),d.final()]));return x.exp>Date.now()?x:null}catch{return null}}
-function cookies(req){return Object.fromEntries((req.headers.cookie||'').split(';').filter(Boolean).map(x=>{const i=x.indexOf('=');return[i<0?x:x.slice(0,i).trim(),decodeURIComponent(i<0?'':x.slice(i+1))]}))}
-function session(req){const v=cookies(req)[COOKIE];return v?unseal(v):null}
-function setCookie(res,name,value,maxAge=604800){res.setHeader('Set-Cookie',`${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`)}
-function clearCookie(res,name){setCookie(res,name,'',0)}
-async function gh(path,token,options={}){const r=await fetch(GH+path,{...options,headers:{Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28',Authorization:`Bearer ${token}`,...(options.headers||{})}});const text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={message:text}}if(!r.ok)throw Object.assign(new Error(data.message||`GitHub request failed (${r.status})`),{status:r.status,data});return data}
-const configured=()=>!!(process.env.GITHUB_CLIENT_ID&&process.env.GITHUB_CLIENT_SECRET&&process.env.SESSION_SECRET);
-function callback(req){const u=urlOf(req);return `${process.env.APP_URL||`${u.protocol}//${u.host}`}/api/auth/github/callback`}
-const WORKFLOW=`name: WyBuild
+const COOKIE = 'wybuild_session';
+const STATE_COOKIE = 'wybuild_oauth_state';
+const GH = 'https://api.github.com';
+const SESSION_DAYS = 7;
+const MAX_REPO_PAGES = 20;
+const MAX_BRANCH_PAGES = 20;
+const MAX_RUN_PAGES = 10;
+const MAX_RELEASE_PAGES = 10;
+const DEFAULT_FREE_LIMIT = 5;
+
+const json = (res, status, body) => {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify(body));
+};
+
+const urlOf = req => new URL(req.url, `http://${req.headers.host}`);
+
+async function body(req) {
+  let s = '';
+  for await (const c of req) s += c;
+  if (!s) return {};
+  try { return JSON.parse(s); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+}
+
+function key() {
+  return crypto.createHash('sha256')
+    .update(process.env.SESSION_SECRET || 'development-only-change-me')
+    .digest();
+}
+
+function seal(obj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key(), iv);
+  const raw = Buffer.from(JSON.stringify({ ...obj, exp: Date.now() + SESSION_DAYS * 86400000 }));
+  const enc = Buffer.concat([cipher.update(raw), cipher.final()]);
+  return [iv, cipher.getAuthTag(), enc].map(x => x.toString('base64url')).join('.');
+}
+
+function unseal(v) {
+  try {
+    const [a, b, c] = v.split('.');
+    if (!a || !b || !c) return null;
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key(), Buffer.from(a, 'base64url'));
+    decipher.setAuthTag(Buffer.from(b, 'base64url'));
+    const x = JSON.parse(Buffer.concat([
+      decipher.update(Buffer.from(c, 'base64url')),
+      decipher.final()
+    ]));
+    return x.exp > Date.now() ? x : null;
+  } catch {
+    return null;
+  }
+}
+
+function cookies(req) {
+  return Object.fromEntries(
+    (req.headers.cookie || '')
+      .split(';')
+      .filter(Boolean)
+      .map(x => {
+        const i = x.indexOf('=');
+        return [i < 0 ? x.trim() : x.slice(0, i).trim(), decodeURIComponent(i < 0 ? '' : x.slice(i + 1))];
+      })
+  );
+}
+
+function session(req) {
+  const v = cookies(req)[COOKIE];
+  return v ? unseal(v) : null;
+}
+
+function setCookie(res, name, value, maxAge = 604800) {
+  const cookie = `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+  const existing = res.getHeader('Set-Cookie');
+  const values = existing ? (Array.isArray(existing) ? existing : [existing]) : [];
+  res.setHeader('Set-Cookie', [...values, cookie]);
+}
+
+function clearCookie(res, name) {
+  setCookie(res, name, '', 0);
+}
+
+async function gh(path, token, options = {}) {
+  const r = await fetch(GH + path, {
+    ...options,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      Authorization: `Bearer ${token}`,
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await r.text();
+  let data = {};
+  try { data = JSON.parse(text); }
+  catch { data = { message: text }; }
+
+  if (!r.ok) {
+    const error = Object.assign(
+      new Error(data.message || `GitHub request failed (${r.status})`),
+      { status: r.status, data }
+    );
+    if (r.headers.get('x-ratelimit-remaining') === '0') error.rateLimited = true;
+    throw error;
+  }
+  return data;
+}
+
+function withPage(path, page, perPage = 100) {
+  const u = new URL(path, 'https://wybuild.internal');
+  u.searchParams.set('per_page', String(perPage));
+  u.searchParams.set('page', String(page));
+  return `${u.pathname}${u.search}`;
+}
+
+async function ghList(path, token, { keyName = null, maxPages = 10, perPage = 100 } = {}) {
+  const out = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const data = await gh(withPage(path, page, perPage), token);
+    const items = keyName ? (Array.isArray(data?.[keyName]) ? data[keyName] : []) : (Array.isArray(data) ? data : []);
+    out.push(...items);
+    if (items.length < perPage) break;
+  }
+  return out;
+}
+
+const configured = () => !!(
+  process.env.GITHUB_CLIENT_ID &&
+  process.env.GITHUB_CLIENT_SECRET &&
+  process.env.SESSION_SECRET
+);
+
+function callback(req) {
+  const u = urlOf(req);
+  const base = (process.env.APP_URL || `${u.protocol}//${u.host}`).replace(/\/$/, '');
+  return `${base}/api/auth/github/callback`;
+}
+
+function appBase(req) {
+  const u = urlOf(req);
+  return (process.env.APP_URL || `${u.protocol}//${u.host}`).replace(/\/$/, '');
+}
+
+function requireSession(req, res) {
+  const s = session(req);
+  if (!s) {
+    json(res, 401, { error: 'GitHub connection required', code: 'AUTH_REQUIRED' });
+    return null;
+  }
+  return s;
+}
+
+function safePart(value, label) {
+  if (typeof value !== 'string' || !value || value.length > 200) {
+    throw Object.assign(new Error(`${label} is invalid`), { status: 400 });
+  }
+  return value;
+}
+
+async function wydevEntitlement(s) {
+  const api = process.env.WYDEV_BILLING_API_URL?.replace(/\/$/, '');
+  if (!api) return { configured: false, plan: 'FREE', buildLimit: DEFAULT_FREE_LIMIT };
+
+  const r = await fetch(`${api}/entitlement`, {
+    headers: {
+      Authorization: `Bearer ${process.env.WYDEV_BILLING_SERVICE_TOKEN || ''}`,
+      'X-GitHub-User': s.user.login,
+      'X-GitHub-User-Id': String(s.user.id)
+    }
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw Object.assign(
+      new Error(d.message || d.error || 'WyDev billing service unavailable'),
+      { status: 502 }
+    );
+  }
+
+  const plan = String(d.plan || 'FREE').toUpperCase();
+  const planDefaults = { FREE: 5, PRO: 50, 'PRO+': 200, PROPLUS: 200 };
+  const parsedLimit = Number(d.buildLimit);
+  return {
+    configured: true,
+    ...d,
+    plan,
+    buildLimit: Number.isFinite(parsedLimit) && parsedLimit >= 0 ? parsedLimit : (planDefaults[plan] ?? DEFAULT_FREE_LIMIT)
+  };
+}
+
+function monthStartISO() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+async function countMonthlyBuilds(s) {
+  const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
+    maxPages: MAX_REPO_PAGES,
+    perPage: 100
+  });
+  const created = encodeURIComponent(`>=${monthStartISO()}`);
+  let count = 0;
+
+  for (let i = 0; i < repos.length; i += 5) {
+    const chunk = repos.slice(i, i + 5);
+    const results = await Promise.all(chunk.map(async repo => {
+      try {
+        const runs = await ghList(
+          `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/actions/runs?created=${created}`,
+          s.token,
+          { keyName: 'workflow_runs', maxPages: 2, perPage: 100 }
+        );
+        return runs.filter(run => run.name === 'WyBuild').length;
+      } catch {
+        return 0;
+      }
+    }));
+    count += results.reduce((a, b) => a + b, 0);
+  }
+  return count;
+}
+
+const WORKFLOW = `name: WyBuild
 on:
   workflow_dispatch:
     inputs:
@@ -39,7 +250,7 @@ jobs:
           cache: gradle
       - name: Validate project
         run: |
-          if [ ! -f ./gradlew ]; then echo 'No gradlew found. WyBuild currently requires a repository with a configured Android Gradle project.'; exit 1; fi
+          if [ ! -f ./gradlew ]; then echo 'No gradlew found. WyBuild requires a repository with a configured Android Gradle project.'; exit 1; fi
           chmod +x ./gradlew
       - name: Build APK
         if: inputs.build_type == 'apk'
@@ -61,36 +272,313 @@ jobs:
           name: wybuild-aab
           path: '**/build/outputs/bundle/**/*.aab'
           if-no-files-found: error`;
-function requireSession(req,res){const s=session(req);if(!s){json(res,401,{error:'GitHub connection required',code:'AUTH_REQUIRED'});return null}return s}
-export default async function handler(req,res){
- try{
-  const u=urlOf(req),route=u.pathname.replace(/^\/api\/?/,'');
-  if(req.method==='GET'&&route==='health')return json(res,200,{ok:true,service:'wybuild'});
-  if(req.method==='GET'&&route==='auth/github'){
-   if(!configured())return json(res,503,{error:'GitHub authentication is not configured. Set APP_URL, SESSION_SECRET, GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.'});
-   const state=crypto.randomBytes(24).toString('hex');setCookie(res,STATE_COOKIE,state,600);const p=new URLSearchParams({client_id:process.env.GITHUB_CLIENT_ID,redirect_uri:callback(req),state,scope:'read:user user:email repo workflow'});res.statusCode=302;res.setHeader('Location',`https://github.com/login/oauth/authorize?${p}`);return res.end();
-  }
-  if(req.method==='GET'&&route==='auth/github/callback'){
-   if(!configured())return json(res,503,{error:'GitHub authentication is not configured.'});const c=cookies(req),code=u.searchParams.get('code'),state=u.searchParams.get('state');if(!code||!state||state!==c[STATE_COOKIE])return json(res,400,{error:'GitHub connection failed: invalid OAuth state.'});
-   const tr=await fetch('https://github.com/login/oauth/access_token',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({client_id:process.env.GITHUB_CLIENT_ID,client_secret:process.env.GITHUB_CLIENT_SECRET,code,redirect_uri:callback(req)})});const token=await tr.json();if(!token.access_token)throw new Error(token.error_description||'GitHub token exchange failed');const me=await gh('/user',token.access_token);setCookie(res,COOKIE,seal({token:token.access_token,user:{id:me.id,login:me.login,name:me.name,avatar:me.avatar_url}}));clearCookie(res,STATE_COOKIE);res.statusCode=302;res.setHeader('Location',`${process.env.APP_URL||`${u.protocol}//${u.host}`}/projects`);return res.end();
-  }
-  if(req.method==='POST'&&route==='auth/logout'){clearCookie(res,COOKIE);return json(res,200,{ok:true})}
-  if(req.method==='GET'&&route==='auth/me'){const s=session(req);if(!s)return json(res,200,{authenticated:false});try{const me=await gh('/user',s.token);return json(res,200,{authenticated:true,user:{id:me.id,login:me.login,name:me.name,avatar:me.avatar_url}})}catch{return json(res,401,{authenticated:false,error:'GitHub session expired or revoked.'})}}
 
-  if(req.method==='GET'&&route==='billing/status'){const s=requireSession(req,res);if(!s)return;const api=process.env.WYDEV_BILLING_API_URL?.replace(/\/$/,'');if(!api)return json(res,200,{plan:'FREE',buildsUsed:0,buildLimit:5,paymentStatus:'managed by WyDev',source:'wydev',billingConfigured:false,billingUrl:process.env.WYDEV_BILLING_URL||undefined});const r=await fetch(`${api}/entitlement`,{headers:{Authorization:`Bearer ${process.env.WYDEV_BILLING_SERVICE_TOKEN||''}`,'X-GitHub-User':s.user.login,'X-GitHub-User-Id':String(s.user.id)}});const d=await r.json().catch(()=>({}));if(!r.ok)return json(res,502,{error:'WyDev billing service unavailable',details:d.message||d.error});return json(res,200,{...d,source:'wydev',billingUrl:d.billingUrl||process.env.WYDEV_BILLING_URL||undefined})}
-  const s=requireSession(req,res);if(!s)return;
-  if(req.method==='GET'&&route==='github/repos')return json(res,200,await gh('/user/repos?per_page=100&sort=updated',s.token));
-  if(req.method==='GET'&&route==='github/branches'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo');if(!o||!r)return json(res,400,{error:'owner and repo are required'});return json(res,200,await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/branches?per_page=100`,s.token))}
-  if(req.method==='GET'&&route==='github/workflow'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo'),ref=u.searchParams.get('ref');if(!o||!r||!ref)return json(res,400,{error:'owner, repo and ref are required'});try{await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`,s.token);return json(res,200,{exists:true})}catch(e){if(e.status===404)return json(res,200,{exists:false});throw e}}
-  if(req.method==='POST'&&route==='github/install-workflow'){const b=await body(req),{owner,repo,ref}=b;if(!owner||!repo||!ref)return json(res,400,{error:'owner, repo and ref are required'});const branch=`wybuild/setup-${Date.now()}`,baseRef=await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(ref)}`,s.token);await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`,s.token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ref:`refs/heads/${branch}`,sha:baseRef.object.sha})});await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml`,s.token,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:'chore: add WyBuild workflow',content:Buffer.from(WORKFLOW).toString('base64'),branch})});return json(res,201,{ok:true,branch,message:'WyBuild workflow installed on a new branch. Review and merge it when ready.'})}
-  if(req.method==='GET'&&route==='github/runs'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo');if(!o||!r)return json(res,400,{error:'owner and repo are required'});return json(res,200,await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs?per_page=50`,s.token))}
-  if(req.method==='GET'&&route==='github/run'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo'),id=u.searchParams.get('id');if(!o||!r||!id)return json(res,400,{error:'owner, repo and id are required'});return json(res,200,await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${id}`,s.token))}
-  if(req.method==='GET'&&route==='github/artifacts'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo'),id=u.searchParams.get('id');if(!o||!r||!id)return json(res,400,{error:'owner, repo and id are required'});return json(res,200,await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${id}/artifacts?per_page=50`,s.token))}
-  if(req.method==='GET'&&route==='github/artifact'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo'),id=u.searchParams.get('id');if(!o||!r||!id)return json(res,400,{error:'owner, repo and id are required'});const rr=await fetch(`${GH}/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/artifacts/${id}/zip`,{headers:{Authorization:`Bearer ${s.token}`,'X-GitHub-Api-Version':'2022-11-28'}});if(!rr.ok)return json(res,rr.status,{error:'Artifact download unavailable'});res.statusCode=200;res.setHeader('Content-Type','application/zip');res.setHeader('Content-Disposition',`attachment; filename="wybuild-artifact-${id}.zip"`);res.end(Buffer.from(await rr.arrayBuffer()));return}
-  if(req.method==='GET'&&route==='github/logs'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo'),id=u.searchParams.get('id');if(!o||!r||!id)return json(res,400,{error:'owner, repo and id are required'});const rr=await fetch(`${GH}/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${id}/logs`,{headers:{Authorization:`Bearer ${s.token}`,'X-GitHub-Api-Version':'2022-11-28'}});if(!rr.ok)return json(res,rr.status,{error:'GitHub logs unavailable'});res.statusCode=200;res.setHeader('Content-Type','application/zip');res.setHeader('Content-Disposition',`attachment; filename="wybuild-logs-${id}.zip"`);res.end(Buffer.from(await rr.arrayBuffer()));return}
-  if(req.method==='POST'&&route==='github/dispatch'){const b=await body(req),{owner,repo,ref,inputs={}}=b;if(!owner||!repo||!ref)return json(res,400,{error:'owner, repo and ref are required'});try{await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/wybuild.yml/dispatches`,s.token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ref,inputs})})}catch(e){if(e.status===404)return json(res,409,{error:'WyBuild workflow is not installed on this branch. Install it first.',code:'WORKFLOW_MISSING'});throw e}return json(res,202,{ok:true,status:'queued'})}
-  if(req.method==='GET'&&route==='github/releases'){const o=u.searchParams.get('owner'),r=u.searchParams.get('repo');if(!o||!r)return json(res,400,{error:'owner and repo are required'});return json(res,200,await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/releases?per_page=30`,s.token))}
-  if(req.method==='POST'&&route==='github/releases'){const b=await body(req),{owner,repo,tag_name,name,body:notes='',target_commitish,prerelease=false,draft=false}=b;if(!owner||!repo||!tag_name)return json(res,400,{error:'owner, repo and tag_name are required'});return json(res,201,await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases`,s.token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag_name,name:name||tag_name,body:notes,target_commitish,prerelease:!!prerelease,draft:!!draft})}))}
-  return json(res,404,{error:'Route not found'});
- }catch(e){return json(res,e.status||500,{error:e.message||'Something went wrong'})}
+export default async function handler(req, res) {
+  try {
+    const u = urlOf(req);
+    const route = u.pathname.replace(/^\/api\/?/, '');
+
+    if (req.method === 'GET' && route === 'health') {
+      return json(res, 200, { ok: true, service: 'wybuild' });
+    }
+
+    if (req.method === 'GET' && route === 'auth/github') {
+      if (!configured()) {
+        return json(res, 503, { error: 'GitHub authentication is not configured. Set APP_URL, SESSION_SECRET, GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.' });
+      }
+      const state = crypto.randomBytes(24).toString('hex');
+      setCookie(res, STATE_COOKIE, state, 600);
+      const p = new URLSearchParams({
+        client_id: process.env.GITHUB_CLIENT_ID,
+        redirect_uri: callback(req),
+        state,
+        scope: 'read:user user:email repo workflow'
+      });
+      res.statusCode = 302;
+      res.setHeader('Location', `https://github.com/login/oauth/authorize?${p}`);
+      return res.end();
+    }
+
+    if (req.method === 'GET' && route === 'auth/github/callback') {
+      if (!configured()) return json(res, 503, { error: 'GitHub authentication is not configured.' });
+      const c = cookies(req);
+      const code = u.searchParams.get('code');
+      const state = u.searchParams.get('state');
+      if (!code || !state || state !== c[STATE_COOKIE]) {
+        return json(res, 400, { error: 'GitHub connection failed: invalid OAuth state.' });
+      }
+
+      const tr = await fetch('https://github.com/login/oauth/access_token', {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: process.env.GITHUB_CLIENT_ID,
+          client_secret: process.env.GITHUB_CLIENT_SECRET,
+          code,
+          redirect_uri: callback(req)
+        })
+      });
+      const token = await tr.json();
+      if (!token.access_token) throw new Error(token.error_description || 'GitHub token exchange failed');
+
+      const me = await gh('/user', token.access_token);
+      setCookie(res, COOKIE, seal({
+        token: token.access_token,
+        user: { id: me.id, login: me.login, name: me.name, avatar: me.avatar_url }
+      }));
+      clearCookie(res, STATE_COOKIE);
+      res.statusCode = 302;
+      res.setHeader('Location', `${appBase(req)}/projects`);
+      return res.end();
+    }
+
+    if (req.method === 'POST' && route === 'auth/logout') {
+      clearCookie(res, COOKIE);
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === 'GET' && route === 'auth/me') {
+      const s = session(req);
+      if (!s) return json(res, 200, { authenticated: false });
+      try {
+        const me = await gh('/user', s.token);
+        return json(res, 200, { authenticated: true, user: { id: me.id, login: me.login, name: me.name, avatar: me.avatar_url } });
+      } catch {
+        clearCookie(res, COOKIE);
+        return json(res, 401, { authenticated: false, error: 'GitHub session expired or revoked.' });
+      }
+    }
+
+    const s = requireSession(req, res);
+    if (!s) return;
+
+    if (req.method === 'GET' && route === 'billing/status') {
+      try {
+        const d = await wydevEntitlement(s);
+        return json(res, 200, {
+          ...d,
+          plan: String(d.plan || 'FREE').toUpperCase(),
+          buildsUsed: Number.isFinite(Number(d.buildsUsed)) ? Number(d.buildsUsed) : 0,
+          source: 'wydev',
+          billingUrl: d.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      } catch (e) {
+        return json(res, e.status || 502, { error: e.message || 'WyDev billing service unavailable' });
+      }
+    }
+
+    if (req.method === 'GET' && route === 'github/repos') {
+      const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
+        maxPages: MAX_REPO_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, repos);
+    }
+
+    if (req.method === 'GET' && route === 'github/branches') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const branches = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/branches`, s.token, {
+        maxPages: MAX_BRANCH_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, branches);
+    }
+
+    if (req.method === 'GET' && route === 'github/workflow') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const ref = safePart(u.searchParams.get('ref'), 'ref');
+      try {
+        await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, s.token);
+        return json(res, 200, { exists: true });
+      } catch (e) {
+        if (e.status === 404) return json(res, 200, { exists: false });
+        throw e;
+      }
+    }
+
+    if (req.method === 'POST' && route === 'github/install-workflow') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const ref = safePart(b.ref, 'ref');
+      const branch = `wybuild/setup-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const baseRef = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(ref)}`, s.token);
+
+      await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`, s.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseRef.object.sha })
+      });
+
+      try {
+        await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml`, s.token, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: 'chore: add WyBuild workflow',
+            content: Buffer.from(WORKFLOW).toString('base64'),
+            branch
+          })
+        });
+      } catch (e) {
+        // Best-effort cleanup if workflow creation fails.
+        try { await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs/heads/${encodeURIComponent(branch)}`, s.token, { method: 'DELETE' }); } catch {}
+        throw e;
+      }
+
+      return json(res, 201, { ok: true, branch, message: 'WyBuild workflow installed on a new branch. Review and merge it when ready.' });
+    }
+
+    if (req.method === 'GET' && route === 'github/runs') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const created = u.searchParams.get('created');
+      const query = created ? `?created=${encodeURIComponent(created)}` : '';
+      const runs = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs${query}`, s.token, {
+        keyName: 'workflow_runs',
+        maxPages: MAX_RUN_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, { total_count: runs.length, workflow_runs: runs });
+    }
+
+    if (req.method === 'GET' && route === 'github/run') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      return json(res, 200, await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}`, s.token));
+    }
+
+    if (req.method === 'GET' && route === 'github/artifacts') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      return json(res, 200, await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}/artifacts?per_page=100`, s.token));
+    }
+
+    if (req.method === 'GET' && route === 'github/artifact') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      const rr = await fetch(`${GH}/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/artifacts/${encodeURIComponent(id)}/zip`, {
+        headers: { Authorization: `Bearer ${s.token}`, 'X-GitHub-Api-Version': '2022-11-28' }
+      });
+      if (!rr.ok) return json(res, rr.status, { error: 'Artifact download unavailable' });
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="wybuild-artifact-${id}.zip"`);
+      res.end(Buffer.from(await rr.arrayBuffer()));
+      return;
+    }
+
+    if (req.method === 'GET' && route === 'github/logs') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      const rr = await fetch(`${GH}/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}/logs`, {
+        headers: { Authorization: `Bearer ${s.token}`, 'X-GitHub-Api-Version': '2022-11-28' }
+      });
+      if (!rr.ok) return json(res, rr.status, { error: 'GitHub logs unavailable' });
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="wybuild-logs-${id}.zip"`);
+      res.end(Buffer.from(await rr.arrayBuffer()));
+      return;
+    }
+
+    if (req.method === 'POST' && route === 'github/dispatch') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const ref = safePart(b.ref, 'ref');
+      const inputs = b.inputs && typeof b.inputs === 'object' ? b.inputs : {};
+      const buildType = inputs.build_type === 'aab' ? 'aab' : inputs.build_type === 'apk' ? 'apk' : null;
+      const buildMode = inputs.build_mode === 'release' ? 'release' : inputs.build_mode === 'debug' ? 'debug' : null;
+      if (!buildType || !buildMode) return json(res, 400, { error: 'build_type and build_mode must be apk/aab and debug/release' });
+
+      const entitlement = await wydevEntitlement(s);
+      const limit = Number(entitlement.buildLimit);
+      const monthlyUsed = await countMonthlyBuilds(s);
+      if (!Number.isFinite(limit) || limit < 0) return json(res, 502, { error: 'Billing returned an invalid build limit.' });
+      if (monthlyUsed >= limit) {
+        return json(res, 402, {
+          error: `Monthly build limit reached (${monthlyUsed}/${limit}). Upgrade your WyDev plan to continue building.`,
+          code: 'BUILD_LIMIT_REACHED',
+          plan: String(entitlement.plan || 'FREE').toUpperCase(),
+          buildsUsed: monthlyUsed,
+          buildLimit: limit,
+          billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      }
+
+      try {
+        await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/wybuild.yml/dispatches`, s.token, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ref, inputs: { build_type: buildType, build_mode: buildMode } })
+        });
+      } catch (e) {
+        if (e.status === 404) return json(res, 409, { error: 'WyBuild workflow is not installed on this branch. Install it first.', code: 'WORKFLOW_MISSING' });
+        if (e.status === 403) return json(res, 403, { error: 'GitHub denied workflow execution. Re-authorize WyBuild with the required repository permissions.', code: 'GITHUB_PERMISSION_DENIED' });
+        throw e;
+      }
+
+      return json(res, 202, {
+        ok: true,
+        status: 'queued',
+        buildsUsed: monthlyUsed + 1,
+        buildLimit: limit
+      });
+    }
+
+    if (req.method === 'GET' && route === 'github/releases') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const releases = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/releases`, s.token, {
+        maxPages: MAX_RELEASE_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, releases);
+    }
+
+    if (req.method === 'POST' && route === 'github/releases') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const tag_name = safePart(b.tag_name, 'tag_name').trim();
+      const name = typeof b.name === 'string' ? b.name.trim() : '';
+      const notes = typeof b.body === 'string' ? b.body.trim() : '';
+      const target_commitish = typeof b.target_commitish === 'string' && b.target_commitish.trim() ? b.target_commitish.trim() : undefined;
+      const prerelease = !!b.prerelease;
+      const draft = !!b.draft;
+      if (!/^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(tag_name)) {
+        return json(res, 400, { error: 'Tag name must look like 1.0.0 or v1.0.0.' });
+      }
+
+      const releaseBody = {
+        tag_name,
+        name: name || tag_name,
+        body: notes,
+        target_commitish,
+        prerelease,
+        draft,
+        generate_release_notes: !notes
+      };
+      if (!target_commitish) delete releaseBody.target_commitish;
+      if (notes) delete releaseBody.generate_release_notes;
+
+      return json(res, 201, await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases`, s.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(releaseBody)
+      }));
+    }
+
+    return json(res, 404, { error: 'Route not found' });
+  } catch (e) {
+    if (e?.rateLimited) return json(res, 429, { error: 'GitHub API rate limit reached. Please wait and try again.' });
+    return json(res, e.status || 500, { error: e.message || 'Something went wrong' });
+  }
 }
