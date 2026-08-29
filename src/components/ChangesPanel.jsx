@@ -1,1 +1,0 @@
-export default function ChangesPanel({changes,onSelect}){return <section className="panel"><h3>CHANGES</h3>{changes.length?<>{changes.map(c=><button className="change" key={c.path} onClick={()=>onSelect(c.path)}><b>{c.status}</b><span>{c.path}</span></button>)}</>:<p className="muted">No local changes.</p>}</section>}
