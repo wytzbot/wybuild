@@ -242,16 +242,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate project
+        run: |
+          if [ ! -f ./gradlew ]; then
+            echo "::error::No gradlew found. WyBuild requires a repository with a configured Android Gradle project."
+            exit 1
+          fi
+          chmod +x ./gradlew
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - name: Validate project
-        run: |
-          if [ ! -f ./gradlew ]; then echo 'No gradlew found. WyBuild requires a repository with a configured Android Gradle project.'; exit 1; fi
-          chmod +x ./gradlew
       - name: Build APK
         if: inputs.build_type == 'apk'
         run: ./gradlew assemble\${{ inputs.build_mode == 'release' && 'Release' || 'Debug' }} --no-daemon
@@ -389,14 +392,31 @@ export default async function handler(req, res) {
       const o = safePart(u.searchParams.get('owner'), 'owner');
       const r = safePart(u.searchParams.get('repo'), 'repo');
       const ref = safePart(u.searchParams.get('ref'), 'ref');
+
+      let exists = false;
       try {
         await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, s.token);
-        return json(res, 200, { exists: true });
+        exists = true;
       } catch (e) {
-        if (e.status === 404) return json(res, 200, { exists: false });
-        throw e;
+        if (e.status !== 404) throw e;
       }
+
+      // File-existence on this ref isn't enough: GitHub only lets you dispatch a
+      // workflow_dispatch run once the workflow is registered, which only happens once
+      // the file is on the default branch. Check the real Actions registry too.
+      let dispatchable = false;
+      try {
+        const workflows = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/workflows`, s.token, {
+          keyName: 'workflows',
+          maxPages: 3,
+          perPage: 100
+        });
+        dispatchable = workflows.some(w => w.path === '.github/workflows/wybuild.yml' && w.state === 'active');
+      } catch { /* leave dispatchable false; UI will prompt to install/merge */ }
+
+      return json(res, 200, { exists, dispatchable });
     }
+
 
     if (req.method === 'POST' && route === 'github/install-workflow') {
       const b = await body(req);
@@ -404,6 +424,8 @@ export default async function handler(req, res) {
       const repo = safePart(b.repo, 'repo');
       const ref = safePart(b.ref, 'ref');
       const branch = `wybuild/setup-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const repoInfo = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, s.token);
+      const defaultBranch = repoInfo.default_branch;
       const baseRef = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(ref)}`, s.token);
 
       await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`, s.token, {
@@ -428,7 +450,49 @@ export default async function handler(req, res) {
         throw e;
       }
 
-      return json(res, 201, { ok: true, branch, message: 'WyBuild workflow installed on a new branch. Review and merge it when ready.' });
+      // GitHub only ever registers a workflow_dispatch-triggerable workflow once the
+      // file exists on the repo's default branch - a copy on a side branch is invisible
+      // to the dispatch endpoint no matter what ref you pass it. Open a PR into the
+      // default branch and try to merge it automatically so builds work immediately;
+      // if that's blocked (branch protection, permissions, existing PR), fall back to
+      // surfacing the PR link so the user can merge it themselves.
+      let prUrl, merged = false;
+      if (branch !== defaultBranch) {
+        try {
+          const pr = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`, s.token, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: 'Add WyBuild workflow',
+              head: branch,
+              base: defaultBranch,
+              body: 'Adds the WyBuild GitHub Actions workflow.\n\nGitHub only allows manually-triggered (`workflow_dispatch`) workflows to run once they exist on the default branch, so this needs to be merged before WyBuild can start builds.'
+            })
+          });
+          prUrl = pr.html_url;
+          try {
+            await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pr.number}/merge`, s.token, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ merge_method: 'squash' })
+            });
+            merged = true;
+          } catch { /* protected branch, no permission, etc - user merges manually via prUrl */ }
+        } catch { /* PR creation failed - still return the branch so the user can act on it */ }
+      }
+
+      return json(res, 201, {
+        ok: true,
+        branch,
+        defaultBranch,
+        prUrl,
+        merged,
+        message: merged
+          ? 'WyBuild workflow installed and merged into the default branch. You can build now.'
+          : prUrl
+            ? `WyBuild workflow committed and a pull request opened into ${defaultBranch}. Merge it before building - GitHub only allows manual builds for workflows on the default branch.`
+            : `WyBuild workflow committed to ${branch}, but WyBuild could not open a pull request automatically. Open one into ${defaultBranch} and merge it before building.`
+      });
     }
 
     if (req.method === 'GET' && route === 'github/runs') {

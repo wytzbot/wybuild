@@ -15,16 +15,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate project
+        run: |
+          if [ ! -f ./gradlew ]; then
+            echo "::error::No gradlew found. WyBuild currently requires a repository with a configured Android Gradle project."
+            exit 1
+          fi
+          chmod +x ./gradlew
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - name: Validate project
-        run: |
-          if [ ! -f ./gradlew ]; then echo 'No gradlew found. WyBuild currently requires a repository with a configured Android Gradle project.'; exit 1; fi
-          chmod +x ./gradlew
       - name: Build APK
         if: inputs.build_type == 'apk'
         run: ./gradlew assemble${{ inputs.build_mode == 'release' && 'Release' || 'Debug' }} --no-daemon
