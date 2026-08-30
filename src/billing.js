@@ -24,6 +24,7 @@ export const DEFAULT_PLANS={
 };
 
 export const getBillingStatus=()=>api('/api/billing/status');
+export const resetUsage=()=>api('/api/billing/reset-usage', {method:'POST'});
 
 export function openWyDevBilling(){
   const url=import.meta.env.VITE_WYDEV_BILLING_URL;

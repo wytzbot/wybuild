@@ -577,6 +577,68 @@ export default async function handler(req, res) {
       }
     }
 
+    // Owner-only: wipes this month's WyBuild quota by cancelling any
+    // in-progress runs and deleting this month's WyBuild workflow runs
+    // (success + in-progress) across every repo the account can see. This is
+    // intentionally NOT exposed to regular users - letting anyone reset their
+    // own usage on demand would make the monthly build limit meaningless.
+    const RESET_USAGE_OWNER = 'wytzbot';
+    if (req.method === 'POST' && route === 'billing/reset-usage') {
+      if (String(s.user.login || '').toLowerCase() !== RESET_USAGE_OWNER) {
+        return json(res, 403, { error: 'Not authorized to reset usage.' });
+      }
+      try {
+        const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
+          maxPages: MAX_REPO_PAGES,
+          perPage: 100
+        });
+        const created = encodeURIComponent(`>=${monthStartISO()}`);
+        let deleted = 0;
+        let cancelled = 0;
+        let failed = 0;
+
+        for (let i = 0; i < repos.length; i += 5) {
+          const chunk = repos.slice(i, i + 5);
+          await Promise.all(chunk.map(async repo => {
+            const base = `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/actions/runs`;
+            let runs = [];
+            try {
+              const [successRuns, activeRuns] = await Promise.all([
+                ghList(`${base}?created=${created}&conclusion=success`, s.token, { keyName: 'workflow_runs', maxPages: 1, perPage: 100 }),
+                ghList(`${base}?created=${created}&status=in_progress`, s.token, { keyName: 'workflow_runs', maxPages: 1, perPage: 100 })
+              ]);
+              runs = [...successRuns, ...activeRuns].filter(run => run.name === 'WyBuild');
+            } catch { return; }
+
+            for (const run of runs) {
+              // Cancelling first matters even if delete fails below - a
+              // cancelled run's status is no longer in_progress, so it stops
+              // reserving a quota slot immediately.
+              if (run.status === 'in_progress' || run.status === 'queued') {
+                try { await gh(`${base}/${run.id}/cancel`, s.token, { method: 'POST' }); cancelled += 1; } catch {}
+              }
+              try {
+                await gh(`${base}/${run.id}`, s.token, { method: 'DELETE' });
+                deleted += 1;
+              } catch {
+                failed += 1;
+              }
+            }
+          }));
+        }
+
+        return json(res, 200, {
+          ok: true,
+          deleted,
+          cancelled,
+          failed,
+          message: `Cleared ${deleted} run${deleted === 1 ? '' : 's'} counted toward this month's quota${failed ? ` (${failed} could not be removed - likely still finishing on GitHub's side, retry in a minute).` : '.'}`
+        });
+      } catch (e) {
+        return json(res, e.status || 502, { error: e.message || 'Failed to reset usage.' });
+      }
+    }
+
     if (req.method === 'GET' && route === 'github/repos') {
       const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
         maxPages: MAX_REPO_PAGES,

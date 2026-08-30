@@ -1,12 +1,16 @@
 import React,{useEffect,useState} from 'react';
 import {Link} from 'react-router-dom';
-import {DEFAULT_PLANS,getBillingStatus,openWyDevBilling} from '../billing';
+import {DEFAULT_PLANS,getBillingStatus,openWyDevBilling,resetUsage} from '../billing';
 import {getSession} from '../github';
+
+const OWNER_LOGIN='wytzbot';
 
 export default function Billing(){
   const [session,setSession]=useState(undefined);
   const [status,setStatus]=useState(null);
   const [error,setError]=useState('');
+  const [resetting,setResetting]=useState(false);
+  const [resetMsg,setResetMsg]=useState('');
 
   const load=()=>{setError('');getBillingStatus().then(setStatus).catch(e=>setError(e.message))};
   useEffect(()=>{getSession().then(x=>{setSession(x);if(x)load()}).catch(e=>{setSession(null);setError(e.message)})},[]);
@@ -15,6 +19,14 @@ export default function Billing(){
   if(!session) return <div className="page"><div className="eyebrow">SUBSCRIPTION</div><h1 className="title">Billing</h1><div className="card"><h3>Connect GitHub first</h3><p className="muted">WyBuild links your billing entitlement to your authenticated WyDev account.</p><Link className="btn" to="/projects">Connect GitHub</Link></div></div>;
 
   const currentPlanKey = status ? String(status.plan||'FREE').toUpperCase() : null;
+  const isOwner = String(session.user?.login||'').toLowerCase() === OWNER_LOGIN;
+
+  const doReset=async()=>{
+    setResetting(true);setResetMsg('');setError('');
+    try{ const r=await resetUsage(); setResetMsg(r.message||'Usage reset.'); load(); }
+    catch(e){ setError(e.message); }
+    finally{ setResetting(false); }
+  };
 
   return <div className="page">
     <div className="eyebrow">SUBSCRIPTION</div>
@@ -34,6 +46,11 @@ export default function Billing(){
         {status.billingUrl
           ? <button className="btn primary" onClick={()=>window.location.assign(status.billingUrl)}>Manage subscription in WyDev</button>
           : <button className="btn secondary" onClick={()=>{try{openWyDevBilling()}catch(e){setError(e.message)}}}>Open WyDev billing</button>}
+        {isOwner && <div style={{marginTop:14,paddingTop:14,borderTop:'1px solid #262b33'}}>
+          <p className="muted">Owner tools</p>
+          <button className="btn secondary" disabled={resetting} onClick={doReset}>{resetting?'Resetting…':'Reset my usage to 0'}</button>
+          {resetMsg && <p className="muted" style={{marginTop:8}}>{resetMsg}</p>}
+        </div>}
       </div>
     </>}
 
