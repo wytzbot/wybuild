@@ -34,13 +34,13 @@ const features = [
   {
     title: 'App icon',
     icon: '🖼️',
-    summary: 'Preserve the project's existing Android icon configuration during the build.',
+    summary: "Preserve the project's existing Android icon configuration during the build.",
     how: 'WyBuild does not invent an icon. It builds the repository as supplied, so an existing Android icon/resource configuration is retained by Gradle or Flutter.'
   },
   {
     title: 'Splash screen',
     icon: '✨',
-    summary: 'Preserve the project's existing Android/Flutter launch-screen configuration.',
+    summary: "Preserve the project's existing Android/Flutter launch-screen configuration.",
     how: 'WyBuild builds the existing project configuration. If the Android or Flutter project already defines a splash/launch screen, the generated app uses that configuration.'
   },
   {
@@ -58,7 +58,7 @@ const features = [
   {
     title: 'Existing Android behavior',
     icon: '↩️',
-    summary: 'Keep the repository's existing Android navigation behavior intact.',
+    summary: "Keep the repository's existing Android navigation behavior intact.",
     how: 'WyBuild does not inject navigation code. Any back-button/WebView behavior comes from the project being built.'
   },
   {
@@ -70,7 +70,7 @@ const features = [
   {
     title: 'GitHub Actions automation',
     icon: '⚙️',
-    summary: 'Builds happen in GitHub instead of on the user's phone or computer.',
+    summary: "Builds happen in GitHub instead of on the user's phone or computer.",
     how: 'WyBuild installs the appropriate workflow into the selected repository. GitHub Actions checks out the project, detects the technology, prepares Java/Flutter/Node as needed, builds it and uploads the correct artifact.'
   },
   {
