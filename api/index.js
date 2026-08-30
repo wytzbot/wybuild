@@ -670,13 +670,27 @@ export default async function handler(req, res) {
       });
 
       try {
+        // The new branch is cut from baseRef, so if wybuild.yml already exists there
+        // (the common "installed but outdated" case), GitHub's contents API requires
+        // that file's current sha to overwrite it - omitting it fails with
+        // `Invalid request. "sha" wasn't supplied.`. Look it up on the branch we just
+        // created (same content as baseRef) and include it when present.
+        let existingSha;
+        try {
+          const existing = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(branch)}`, s.token);
+          existingSha = existing.sha;
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+
         await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml`, s.token, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            message: 'chore: add WyBuild workflow',
+            message: existingSha ? 'chore: update WyBuild workflow' : 'chore: add WyBuild workflow',
             content: Buffer.from(WORKFLOW).toString('base64'),
-            branch
+            branch,
+            ...(existingSha ? { sha: existingSha } : {})
           })
         });
       } catch (e) {
