@@ -1,2 +1,53 @@
-import React,{useEffect,useState} from 'react';import {Link} from 'react-router-dom';import {DEFAULT_PLANS,getBillingStatus,openWyDevBilling} from '../billing';import {getSession} from '../github';
-export default function Billing(){const[session,setSession]=useState(undefined),[status,setStatus]=useState(null),[error,setError]=useState('');const load=()=>{setError('');getBillingStatus().then(setStatus).catch(e=>setError(e.message))};useEffect(()=>{getSession().then(x=>{setSession(x);if(x)load()}).catch(e=>{setSession(null);setError(e.message)})},[]);if(session===undefined)return <div className="page"><h1 className="title">Billing</h1><div className="card">Loading…</div></div>;if(!session)return <div className="page"><div className="eyebrow">SUBSCRIPTION</div><h1 className="title">Billing</h1><div className="card"><h3>Connect GitHub first</h3><p className="muted">WyBuild links your billing entitlement to your authenticated WyDev account.</p><Link className="btn" to="/projects">Connect GitHub</Link></div></div>;return <div className="page"><div className="eyebrow">SUBSCRIPTION</div><h1 className="title">Billing</h1><p className="sub">Flutterwave payments are handled by WyDev. WyBuild only reads the server-confirmed entitlement.</p>{error&&<div className="notice error">{error}<button className="btn secondary" onClick={load}>Retry</button></div>}{status&&<><div className="notice"><strong>Billing authority: WyDev</strong><br/>Payment verification and subscription state are controlled by WyDev.</div><div className="card"><div className="eyebrow">CURRENT PLAN</div><h2>{String(status.plan||'FREE').toUpperCase()}</h2><p className="muted">{status.buildsUsed??0} / {status.buildLimit??DEFAULT_PLANS.free.builds} successful builds used</p><p className="muted">Payment status: {status.paymentStatus||'not provided'}</p>{status.billingUrl?<button className="btn primary" onClick={()=>window.location.assign(status.billingUrl)}>Manage subscription in WyDev</button>:<button className="btn secondary" onClick={()=>{try{openWyDevBilling()}catch(e){setError(e.message)}}}>Open WyDev billing</button>}</div></>}<div className="grid">{Object.values(DEFAULT_PLANS).map(p=><div className="card" key={p.label}><div className="eyebrow">{p.label}</div><h3>₦{p.ngn.toLocaleString()} / ${p.usd}</h3><p className="muted">{p.builds} successful builds / month</p></div>)}</div></div>}
+import React,{useEffect,useState} from 'react';
+import {Link} from 'react-router-dom';
+import {DEFAULT_PLANS,getBillingStatus,openWyDevBilling} from '../billing';
+import {getSession} from '../github';
+
+export default function Billing(){
+  const [session,setSession]=useState(undefined);
+  const [status,setStatus]=useState(null);
+  const [error,setError]=useState('');
+
+  const load=()=>{setError('');getBillingStatus().then(setStatus).catch(e=>setError(e.message))};
+  useEffect(()=>{getSession().then(x=>{setSession(x);if(x)load()}).catch(e=>{setSession(null);setError(e.message)})},[]);
+
+  if(session===undefined) return <div className="page"><h1 className="title">Billing</h1><div className="card">Loading…</div></div>;
+  if(!session) return <div className="page"><div className="eyebrow">SUBSCRIPTION</div><h1 className="title">Billing</h1><div className="card"><h3>Connect GitHub first</h3><p className="muted">WyBuild links your billing entitlement to your authenticated WyDev account.</p><Link className="btn" to="/projects">Connect GitHub</Link></div></div>;
+
+  const currentPlanKey = status ? String(status.plan||'FREE').toUpperCase() : null;
+
+  return <div className="page">
+    <div className="eyebrow">SUBSCRIPTION</div>
+    <h1 className="title">Billing</h1>
+    <p className="sub">Flutterwave payments are handled by WyDev. WyBuild only reads the server-confirmed entitlement.</p>
+
+    {error && <div className="notice error">{error}<button className="btn secondary" onClick={load}>Retry</button></div>}
+
+    {status && <>
+      <div className="notice"><strong>Billing authority: WyDev</strong><br/>Payment verification and subscription state are controlled by WyDev.</div>
+      <div className="card">
+        <div className="eyebrow">CURRENT PLAN</div>
+        <h2>{currentPlanKey}</h2>
+        <p className="muted">{status.buildsUsed??0} / {status.buildLimit??DEFAULT_PLANS.free.builds} successful builds used this month</p>
+        <p className="muted">{status.inProgressBuilds??0} / {status.concurrencyLimit??DEFAULT_PLANS.free.concurrency} builds in progress right now</p>
+        <p className="muted">Payment status: {status.paymentStatus||'not provided'}</p>
+        {status.billingUrl
+          ? <button className="btn primary" onClick={()=>window.location.assign(status.billingUrl)}>Manage subscription in WyDev</button>
+          : <button className="btn secondary" onClick={()=>{try{openWyDevBilling()}catch(e){setError(e.message)}}}>Open WyDev billing</button>}
+      </div>
+    </>}
+
+    <div className="grid">
+      {Object.values(DEFAULT_PLANS).map(p=>
+        <div className={'card plan-card'+(currentPlanKey===p.label?' current':'')} key={p.label}>
+          <div className="eyebrow">{p.label}{currentPlanKey===p.label?' · CURRENT':''}</div>
+          <h3>₦{p.ngn.toLocaleString()} / ${p.usd}</h3>
+          <p className="muted">{p.builds} successful builds / month</p>
+          <ul className="plan-features">
+            {p.features.map(f=><li key={f}>{f}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  </div>;
+}

@@ -11,6 +11,19 @@ const MAX_RELEASE_PAGES = 10;
 const DEFAULT_FREE_LIMIT = 5;
 const activeBuildLocks = new Map();
 
+// A GitHub Actions run can get stuck reporting status=in_progress and never
+// transition to completed (a lost runner, a GitHub-side hiccup, a job killed
+// out-of-band). Without a cutoff, a single stuck run would reserve a quota
+// slot forever and could make a plan look "full" even with zero successful
+// builds. Anything still in_progress after this many hours is treated as
+// abandoned and excluded from the reserved-slot count.
+const STALE_ACTIVE_HOURS = 3;
+
+// How many builds a plan may have in flight (queued/in_progress) at once,
+// independent of the monthly successful-build quota. Paid plans can run
+// several builds in parallel instead of waiting for one to finish.
+const PLAN_CONCURRENCY = { FREE: 1, PRO: 5, 'PRO+': 15, PROPLUS: 15 };
+
 const json = (res, status, body) => {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -210,7 +223,8 @@ async function countMonthlyBuilds(s) {
 
   // Query successful and active runs separately. This is both more accurate
   // and cheaper than paging through every failed/cancelled run. A failed build
-  // never consumes quota; an active build temporarily reserves a slot.
+  // never consumes quota; an active build temporarily reserves a slot, unless
+  // it has been in_progress past STALE_ACTIVE_HOURS (see constant above).
   for (let i = 0; i < repos.length; i += 5) {
     const chunk = repos.slice(i, i + 5);
     const results = await Promise.all(chunk.map(async repo => {
@@ -224,9 +238,10 @@ async function countMonthlyBuilds(s) {
             keyName: 'workflow_runs', maxPages: 1, perPage: 100
           })
         ]);
+        const staleCutoff = Date.now() - STALE_ACTIVE_HOURS * 3600000;
         return {
           successful: successRuns.filter(run => run.name === 'WyBuild').length,
-          active: activeRuns.filter(run => run.name === 'WyBuild').length
+          active: activeRuns.filter(run => run.name === 'WyBuild' && new Date(run.created_at).getTime() > staleCutoff).length
         };
       } catch {
         return { successful: 0, active: 0 };
@@ -546,12 +561,14 @@ export default async function handler(req, res) {
         // enforces. Billing may expose its own usage counter, but WyBuild's
         // build quota is specifically based on successful GitHub Actions runs.
         const usage = await countMonthlyBuilds(s);
+        const plan = String(d.plan || 'FREE').toUpperCase();
         return json(res, 200, {
           ...d,
-          plan: String(d.plan || 'FREE').toUpperCase(),
+          plan,
           buildsUsed: usage.successful,
           successfulBuilds: usage.successful,
           inProgressBuilds: usage.active,
+          concurrencyLimit: PLAN_CONCURRENCY[plan] ?? PLAN_CONCURRENCY.FREE,
           source: 'wydev',
           billingUrl: d.billingUrl || process.env.WYDEV_BILLING_URL || undefined
         });
@@ -802,6 +819,8 @@ export default async function handler(req, res) {
       }
       const monthlyUsed = usage.successful;
       const reserved = usage.reserved;
+      const plan = String(entitlement.plan || 'FREE').toUpperCase();
+      const concurrency = PLAN_CONCURRENCY[plan] ?? PLAN_CONCURRENCY.FREE;
       if (monthlyUsed >= limit || reserved >= limit) {
         activeBuildLocks.delete(lockKey);
         return json(res, 402, {
@@ -809,10 +828,24 @@ export default async function handler(req, res) {
             ? `Monthly successful-build limit reached (${monthlyUsed}/${limit}). Failed builds do not consume your quota.`
             : `All remaining successful-build slots are currently in progress (${monthlyUsed} successful, ${usage.active} in progress, ${limit} allowed). Failed builds do not consume your quota.`,
           code: 'BUILD_LIMIT_REACHED',
-          plan: String(entitlement.plan || 'FREE').toUpperCase(),
+          plan,
           buildsUsed: monthlyUsed,
           successfulBuilds: monthlyUsed,
           inProgressBuilds: usage.active,
+          buildLimit: limit,
+          billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      }
+
+      if (usage.active >= concurrency) {
+        activeBuildLocks.delete(lockKey);
+        return json(res, 402, {
+          error: `${plan} allows ${concurrency} build${concurrency === 1 ? '' : 's'} in progress at once (${usage.active} running now). Wait for one to finish${plan === 'FREE' ? ', or upgrade to run builds in parallel' : ''}.`,
+          code: 'CONCURRENCY_LIMIT_REACHED',
+          plan,
+          concurrencyLimit: concurrency,
+          inProgressBuilds: usage.active,
+          buildsUsed: monthlyUsed,
           buildLimit: limit,
           billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
         });
