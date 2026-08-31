@@ -217,6 +217,10 @@ async function countMonthlyBuilds(s) {
     maxPages: MAX_REPO_PAGES,
     perPage: 100
   });
+  if (!Array.isArray(repos)) {
+    throw Object.assign(new Error('GitHub returned an invalid repository list.'), { status: 502 });
+  }
+
   const created = encodeURIComponent(`>=${monthStartISO()}`);
   let successful = 0;
   let active = 0;
@@ -225,33 +229,39 @@ async function countMonthlyBuilds(s) {
   // and cheaper than paging through every failed/cancelled run. A failed build
   // never consumes quota; an active build temporarily reserves a slot, unless
   // it has been in_progress past STALE_ACTIVE_HOURS (see constant above).
+  //
+  // Fail closed if GitHub cannot inspect a repository. Treating an API error
+  // as zero builds could undercount usage and allow a monthly quota bypass.
   for (let i = 0; i < repos.length; i += 5) {
     const chunk = repos.slice(i, i + 5);
     const results = await Promise.all(chunk.map(async repo => {
-      const base = `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/actions/runs`;
-      try {
-        const [successRuns, activeRuns] = await Promise.all([
-          ghList(`${base}?created=${created}&conclusion=success`, s.token, {
-            keyName: 'workflow_runs', maxPages: 1, perPage: 100
-          }),
-          ghList(`${base}?created=${created}&status=in_progress`, s.token, {
-            keyName: 'workflow_runs', maxPages: 1, perPage: 100
-          })
-        ]);
-        const staleCutoff = Date.now() - STALE_ACTIVE_HOURS * 3600000;
-        return {
-          successful: successRuns.filter(run => run.name === 'WyBuild').length,
-          active: activeRuns.filter(run => run.name === 'WyBuild' && new Date(run.created_at).getTime() > staleCutoff).length
-        };
-      } catch {
-        return { successful: 0, active: 0 };
+      if (!repo?.owner?.login || !repo?.name) {
+        throw Object.assign(new Error('GitHub returned an invalid repository record.'), { status: 502 });
       }
+
+      const base = `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/actions/runs`;
+      const [successRuns, activeRuns] = await Promise.all([
+        ghList(`${base}?created=${created}&conclusion=success`, s.token, {
+          keyName: 'workflow_runs', maxPages: 1, perPage: 100
+        }),
+        ghList(`${base}?created=${created}&status=in_progress`, s.token, {
+          keyName: 'workflow_runs', maxPages: 1, perPage: 100
+        })
+      ]);
+
+      const staleCutoff = Date.now() - STALE_ACTIVE_HOURS * 3600000;
+      return {
+        successful: successRuns.filter(run => run.name === 'WyBuild').length,
+        active: activeRuns.filter(run => run.name === 'WyBuild' && new Date(run.created_at).getTime() > staleCutoff).length
+      };
     }));
+
     for (const result of results) {
       successful += result.successful;
       active += result.active;
     }
   }
+
   return { successful, active, reserved: successful + active };
 }
 
@@ -398,7 +408,7 @@ jobs:
         if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
         uses: actions/setup-node@v6
         with:
-          node-version: 34
+          node-version: 24
 
       - name: Install Node dependencies
         if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
@@ -592,6 +602,9 @@ export default async function handler(req, res) {
           maxPages: MAX_REPO_PAGES,
           perPage: 100
         });
+        if (!Array.isArray(repos)) {
+          throw Object.assign(new Error('GitHub returned an invalid repository list.'), { status: 502 });
+        }
         const created = encodeURIComponent(`>=${monthStartISO()}`);
         let deleted = 0;
         let cancelled = 0;
