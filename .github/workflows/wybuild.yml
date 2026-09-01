@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 2
+# wybuild-workflow-version: 4
 name: WyBuild
 on:
   workflow_dispatch:

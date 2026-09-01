@@ -269,7 +269,7 @@ async function countMonthlyBuilds(s) {
 // validation logic, build steps, etc). It's embedded as a YAML comment in the
 // installed file so /api/github/workflow can tell an already-installed repo
 // apart from one running an older generation of the template.
-const WORKFLOW_VERSION = 3;
+const WORKFLOW_VERSION = 4;
 
 const WORKFLOW = `# wybuild-workflow-version: ${WORKFLOW_VERSION}
 name: WyBuild
@@ -325,7 +325,7 @@ jobs:
             else
               type=node-web
             fi
-          elif find . -maxdepth 3 -type f \( -name 'index.html' -o -name '*.html' \) -not -path './.git/*' | grep -q .; then
+          elif find . -maxdepth 3 -type f \\( -name 'index.html' -o -name '*.html' \\) -not -path './.git/*' | grep -q .; then
             type=vanilla
           else
             type=unknown
