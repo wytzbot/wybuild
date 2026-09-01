@@ -36,3 +36,7 @@ export const listRuns = (owner, repo, created) => api(`/api/github/runs?owner=${
 export const getRun = (owner, repo, id) => api(`/api/github/run?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&id=${encodeURIComponent(id)}`);
 export const listArtifacts = (owner, repo, id) => api(`/api/github/artifacts?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&id=${encodeURIComponent(id)}`);
 export const getLogsUrl = (owner, repo, id) => `/api/github/logs?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&id=${encodeURIComponent(id)}`;
+// Resolves to { failedJobs: [{ jobName, jobId, failedStep: {name, number}|null, annotations: [{title, message}] }] }
+export const getRunFailure = (owner, repo, id) => api(`/api/github/run-failure?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&id=${encodeURIComponent(id)}`);
+// Reruns the same workflow run (same inputs) rather than a fresh dispatch.
+export const rerunRun = (owner, repo, id) => api('/api/github/rerun', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner,repo,id}) });

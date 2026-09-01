@@ -839,6 +839,47 @@ export default async function handler(req, res) {
       return json(res, 200, await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}`, s.token));
     }
 
+    if (req.method === 'GET' && route === 'github/run-failure') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+
+      const jobsData = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}/jobs`, s.token);
+      const jobs = Array.isArray(jobsData.jobs) ? jobsData.jobs : [];
+      const failedJobs = jobs.filter(j => j.conclusion === 'failure');
+
+      const results = await Promise.all(failedJobs.map(async job => {
+        const steps = Array.isArray(job.steps) ? job.steps : [];
+        const failedStep = steps.find(st => st.conclusion === 'failure') || null;
+        let annotations = [];
+        try {
+          annotations = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/check-runs/${job.id}/annotations`, s.token);
+        } catch { /* annotations best-effort - fall back to step name only */ }
+        return {
+          jobName: job.name,
+          jobId: job.id,
+          failedStep: failedStep ? { name: failedStep.name, number: failedStep.number } : null,
+          annotations: (Array.isArray(annotations) ? annotations : [])
+            .filter(a => a.annotation_level === 'failure')
+            .map(a => ({ title: a.title || null, message: a.message || null }))
+        };
+      }));
+
+      return json(res, 200, { failedJobs: results });
+    }
+
+    if (req.method === 'POST' && route === 'github/rerun') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const id = safePart(b.id, 'id');
+      // Reruns the exact same run (same workflow_dispatch inputs) rather than a
+      // fresh dispatch, since GitHub's run object doesn't expose the original
+      // inputs for us to replay via a new dispatch call.
+      await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${encodeURIComponent(id)}/rerun`, s.token, { method: 'POST' });
+      return json(res, 200, { ok: true });
+    }
+
     if (req.method === 'GET' && route === 'github/artifacts') {
       const o = safePart(u.searchParams.get('owner'), 'owner');
       const r = safePart(u.searchParams.get('repo'), 'repo');
