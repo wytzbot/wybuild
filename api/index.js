@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { kv } from '@vercel/kv';
 
 const COOKIE = 'wybuild_session';
 const STATE_COOKIE = 'wybuild_oauth_state';
@@ -262,8 +263,40 @@ async function countMonthlyBuilds(s) {
     }
   }
 
-  return { successful, active, reserved: successful + active };
+  const ledgerSuccessful = await countLedgerThisMonth(s);
+  return { successful: successful + ledgerSuccessful, active, reserved: successful + ledgerSuccessful + active };
 }
+
+// --- Deleted-run quota ledger --------------------------------------------
+// Deleting a run from GitHub normally makes it vanish from countMonthlyBuilds,
+// which would let anyone bypass their monthly quota by deleting successful
+// runs. To keep deleted successful runs counted, each deletion increments a
+// per-user, per-month counter in Vercel KV, keyed to the month the run was
+// originally created in (not the month it was deleted), so it lines up with
+// countMonthlyBuilds' own `created` filtering.
+function ledgerKey(login, date) {
+  const d = new Date(date);
+  const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  return `wybuild:ledger:${login}:${monthKey}`;
+}
+
+// Called BEFORE the GitHub delete call - if the KV write succeeds but the
+// delete itself then fails, the run is briefly over-counted rather than
+// under-counted, matching this codebase's existing fail-closed stance on
+// quota accuracy (see countMonthlyBuilds). Errors propagate so a KV outage
+// blocks the delete rather than silently letting quota go uncounted.
+async function recordDeletedRun(s, { createdAt }) {
+  const key = ledgerKey(s.user.login, createdAt);
+  await kv.incr(key);
+  await kv.expire(key, 60 * 24 * 3600); // ~60 days - covers the month plus buffer
+}
+
+async function countLedgerThisMonth(s) {
+  const key = ledgerKey(s.user.login, new Date());
+  const val = await kv.get(key);
+  return Number(val) || 0;
+}
+
 
 // Bump this whenever WORKFLOW's content changes materially (action versions,
 // validation logic, build steps, etc). It's embedded as a YAML comment in the
@@ -837,6 +870,32 @@ export default async function handler(req, res) {
       const r = safePart(u.searchParams.get('repo'), 'repo');
       const id = safePart(u.searchParams.get('id'), 'id');
       return json(res, 200, await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}`, s.token));
+    }
+
+    if (req.method === 'POST' && route === 'github/delete-run') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const id = safePart(b.id, 'id');
+      const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${encodeURIComponent(id)}`;
+
+      const run = await gh(base, s.token);
+      if (run.name !== 'WyBuild') {
+        return json(res, 403, { error: 'Only WyBuild runs can be deleted here.' });
+      }
+
+      if (run.status === 'in_progress' || run.status === 'queued') {
+        try { await gh(`${base}/cancel`, s.token, { method: 'POST' }); } catch { /* best-effort */ }
+      }
+
+      // Record BEFORE deleting: a successful run must still count toward quota
+      // even once removed from GitHub. See recordDeletedRun for the tradeoff.
+      if (run.conclusion === 'success') {
+        await recordDeletedRun(s, { owner, repo, runId: id, createdAt: run.created_at });
+      }
+
+      await gh(base, s.token, { method: 'DELETE' });
+      return json(res, 200, { ok: true });
     }
 
     if (req.method === 'GET' && route === 'github/run-failure') {

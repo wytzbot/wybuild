@@ -40,3 +40,6 @@ export const getLogsUrl = (owner, repo, id) => `/api/github/logs?owner=${encodeU
 export const getRunFailure = (owner, repo, id) => api(`/api/github/run-failure?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&id=${encodeURIComponent(id)}`);
 // Reruns the same workflow run (same inputs) rather than a fresh dispatch.
 export const rerunRun = (owner, repo, id) => api('/api/github/rerun', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner,repo,id}) });
+// Deletes the run from GitHub. Successful runs still count toward this month's
+// quota afterward - the backend records them before deleting.
+export const deleteRun = (owner, repo, id) => api('/api/github/delete-run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({owner,repo,id}) });
