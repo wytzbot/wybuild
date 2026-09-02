@@ -1,0 +1,10 @@
+{
+  "name": "wybuild",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@vercel/kv": "^2.0.0",
+    "adm-zip": "^0.5.16"
+  }
+}

@@ -61,7 +61,7 @@ Never commit secrets.
 
 ## GitHub workflow
 
-The workflow is version 5 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The backend installs it into a setup branch and attempts to create/merge a pull request into the default branch.
+The workflow is version 7 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The backend installs it into a setup branch and attempts to create/merge a pull request into the default branch.
 
 Supported direct Android builds:
 
@@ -82,3 +82,7 @@ Supported web-to-APK:
 ## Billing
 
 WyDev remains the server-side billing authority. WyBuild enforces build limits in the backend; the Flutter frontend is never treated as proof of payment.
+
+
+## Cost model
+WyBuild uses GitHub Actions and the Android/Flutter toolchains already available in CI. WyBuild does not add paid Android SDK libraries or paid native plugins. GitHub Actions usage and any third-party billing plan limits still apply; the service cannot guarantee zero infrastructure cost at arbitrary scale.
