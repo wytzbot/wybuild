@@ -1,0 +1,1 @@
+{"name":"WyBuild","short_name":"WyBuild","start_url":".","display":"standalone","background_color":"#090B10","theme_color":"#090B10","description":"Automatic Android build setup and GitHub Actions shipping platform","icons":[{"src":"icons/Icon-192.png","sizes":"192x192","type":"image/png"},{"src":"icons/Icon-512.png","sizes":"512x512","type":"image/png"}]}

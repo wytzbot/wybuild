@@ -1,87 +1,84 @@
+# WyBuild — Flutter Web
 
-## Supported project types
+WyBuild is a Flutter Web developer build platform that connects GitHub repositories to automated GitHub Actions builds.
 
-WyBuild now uses one workflow for multiple stacks:
+## What changed
 
-- **Flutter** — `flutter pub get`, APK and AAB builds.
-- **Android/Gradle** — Gradle wrapper based APK/AAB builds, including nested Android projects.
-- **React/Vite/Node web** — installs npm/pnpm/yarn dependencies and runs the project build script.
-- **Next.js** — runs the Next build and packages the generated `.next` output.
-- **Vanilla HTML/CSS/JS** — packages the static site without requiring Node.
+The old React/Vite frontend has been consolidated into **one Flutter Web frontend** in `lib/main.dart`.
 
-Use **Auto Detect** when you want WyBuild to choose the appropriate toolchain. Use **Web** when you specifically want web output.
+The backend remains a single Vercel Node function in `api/index.js`.
 
-GitHub's `workflow_dispatch` API requires the workflow to be present on the repository's default branch before manual dispatch is available, so workflow installation may create a pull request when branch protection prevents an automatic merge.
+### New build-setup flow
 
-# WyBuild
+**Projects → Project Doctor → Install/update workflow → choose target → Build**
 
-WyBuild is a GitHub-powered Android build and release interface. It keeps source code in GitHub and runs builds in GitHub Actions; Vercel hosts the web/API layer.
+WyBuild now also supports a **Web → Android APK** path for static Vite/React/Node/vanilla web projects:
 
-## Stack
+1. Detect the web project.
+2. Run its normal web build.
+3. Copy the static output into a temporary Android WebView wrapper.
+4. Generate the Android Gradle project in GitHub Actions.
+5. Install the Gradle wrapper/toolchain.
+6. Build the APK.
+7. Upload the APK as the normal WyBuild artifact.
 
-- React + Vite
-- Vercel Node function (`api/index.js`)
-- GitHub OAuth + REST API + Actions
-- GitHub Actions for isolated builds
-- WyDev for Flutterwave billing authority
+This does not require Android Studio on the developer's phone.
 
-## Current supported build path
+## Important limitation
 
-The production-safe core path is:
+Web → APK currently targets projects that produce a static `index.html` plus assets. Next.js server-rendered applications need a static export or an existing Android wrapper.
 
-**GitHub OAuth → repository → branch → WyBuild workflow → GitHub Actions → APK/AAB artifact → optional GitHub Release**
+Release signing should be configured with GitHub Actions secrets. WyBuild does not put signing keys in the Flutter frontend.
 
-The selected repository must contain an Android Gradle project (`gradlew`). If the workflow is missing, WyBuild can create a separate `wybuild/setup-*` branch containing the workflow so the user can review it before merging.
+## Local Flutter Web development
 
-WyBuild does not silently modify the default branch.
+```bash
+flutter pub get
+flutter run -d chrome
+```
 
-Installing the workflow only writes the file once. If the embedded workflow template (`WORKFLOW` in `api/index.js`) is later updated - for example to bump Actions versions - repositories that installed it earlier keep running their original copy. `GET /api/github/workflow` reports `upToDate`/`installedVersion`/`currentVersion` (based on a `wybuild-workflow-version` marker embedded in the file) so the UI can prompt a reinstall when a repo is behind.
+## Production build
 
-## Local setup
+```bash
+flutter build web --release
+```
 
-1. Install Node 24.x (matches the `engines` field in `package.json`).
-2. Run `npm install`.
-3. Copy `.env.example` to `.env`.
-4. Fill in the GitHub OAuth and session variables.
-5. Set the WyDev billing variables only when the WyDev entitlement API is available.
-6. Run `npm run dev`.
+The Vercel configuration uses `vercel-build.sh` to install Flutter in the build environment when necessary, then publishes `build/web`.
 
-## GitHub OAuth App
+## Backend environment
 
-Create a GitHub OAuth App and set its authorization callback URL to:
+Keep the existing Vercel environment variables:
 
-`https://YOUR-VERCEL-DOMAIN/api/auth/github/callback`
+- `APP_URL`
+- `SESSION_SECRET`
+- `GITHUB_CLIENT_ID`
+- `GITHUB_CLIENT_SECRET`
+- `WYDEV_BILLING_API_URL`
+- `WYDEV_BILLING_SERVICE_TOKEN`
+- `WYDEV_BILLING_URL`
 
-The OAuth application needs access appropriate to the operations you enable. The current workflow installation/build flow requires repository write access because it can create a separate setup branch and add `.github/workflows/wybuild.yml`. Review GitHub's permission screen before authorizing.
+Never commit secrets.
 
-## Vercel
+## GitHub workflow
 
-Use the repository root as the Vercel project root. Vercel should detect Vite automatically:
+The workflow is version 5 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The backend installs it into a setup branch and attempts to create/merge a pull request into the default branch.
 
-- Build command: `npm run build`
-- Output directory: `dist`
-- Node.js: 24.x (the package declares the engine requirement; Vercel disables Node.js 20 for Builds and Functions on October 1, 2026, so set the project's Node.js version to 24.x in Project Settings if it isn't already)
+Supported direct Android builds:
 
-The API is consolidated in `api/index.js`; do not add a separate Vercel function for every endpoint.
+- Flutter → APK/AAB
+- Android/Gradle → APK/AAB
 
-## WyDev billing
+Supported web builds:
 
-WyDev is the only Flutterwave billing authority. WyBuild does not initialize Flutterwave transactions, verify Flutterwave transactions, or receive a Flutterwave webhook. It reads the server-confirmed entitlement exposed by WyDev and enforces the monthly build limit server-side by counting real WyBuild GitHub Actions runs for the current UTC month. This means the limit is enforced even when the frontend is bypassed. For a fully atomic cross-instance quota reservation, a future WyDev billing service can expose a reservation/consume endpoint; the current implementation remains safe against normal client-side bypasses.
+- Vite/React/Node → web artifact
+- Vanilla HTML → web artifact
+- Next.js → web package
 
-## Security
+Supported web-to-APK:
 
-Never commit `.env`, GitHub client secrets, WyDev service tokens, signing credentials, or private keys. GitHub OAuth tokens are kept server-side in an encrypted HttpOnly session cookie.
+- Static Vite/React/Node output
+- Vanilla HTML/static output
 
-## Validation
+## Billing
 
-Run:
-
-`npm run build`
-
-before deployment. The repository also contains a GitHub Actions workflow used by WyBuild builds.
-
-## PWA
-WyBuild is installable as a Progressive Web App. The manifest, service worker, and icons live in `public/` — Vite copies that directory verbatim in both `npm run dev` and `npm run build`, so the install prompt and icons work identically in local development and production.
-
-## Billing authority
-Flutterwave is handled by WyDev. Configure `WYDEV_BILLING_API_URL`, `WYDEV_BILLING_SERVICE_TOKEN`, and `WYDEV_BILLING_URL` only when the corresponding WyDev endpoints exist. WyBuild never treats a frontend flag as proof of payment.
+WyDev remains the server-side billing authority. WyBuild enforces build limits in the backend; the Flutter frontend is never treated as proof of payment.

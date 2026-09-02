@@ -1,8 +1,13 @@
-node_modules/
-dist/
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+# Environment / deployment
 .env
 .env.*
 !.env.example
 .vercel/
 .DS_Store
-npm-debug.log*
