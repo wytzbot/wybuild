@@ -1,7 +1,7 @@
 name: wybuild
 description: WyBuild - automatic Android build setup and GitHub Actions build platform.
 publish_to: "none"
-version: 1.0.0+1
+version: 1.0.1+2
 environment:
   sdk: ">=3.4.0 <4.0.0"
 

@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 5
+# wybuild-workflow-version: 6
 name: WyBuild
 on:
   workflow_dispatch:
@@ -21,6 +21,11 @@ on:
           - debug
           - release
         default: release
+
+# Bakes the requested target into GitHub's run display_title so the frontend
+# can tell, from the runs list alone, whether a run was an apk/aab/web/auto
+# build - no extra API call needed just to label the download button.
+run-name: "WyBuild: ${{ inputs.build_type }} (${{ inputs.build_mode }}) on ${{ github.ref_name }}"
 
 permissions:
   contents: read

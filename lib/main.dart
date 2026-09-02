@@ -183,7 +183,14 @@ class Dashboard extends StatefulWidget { final Map<String,dynamic>? session; fin
 class _DashboardState extends State<Dashboard>{
  int repos=0,runs=0,success=0; bool loading=true; String error='';
  @override void initState(){super.initState();load();}
- Future<void> load() async {if(widget.session==null){setState(()=>loading=false);return;}try{final rs=await api.call('/api/github/repos');int rr=0,ss=0;for(final r in rs){final x=await api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']});for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild'){rr++;if(w['conclusion']=='success')ss++;}}}if(mounted)setState(() { repos=rs.length; runs=rr; success=ss; loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
+ Future<void> load() async {if(widget.session==null){setState(()=>loading=false);return;}try{final rs=await api.call('/api/github/repos');
+  // Fetch every repo's runs in parallel instead of one at a time - with N
+  // repos this turns N sequential round trips into a single wait for the
+  // slowest one. A repo that errors (e.g. Actions disabled) just contributes
+  // zero runs instead of failing the whole dashboard.
+  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).catchError((_)=>{'workflow_runs':[]})));
+  int rr=0,ss=0;for(final x in results){for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild'){rr++;if(w['conclusion']=='success')ss++;}}}
+  if(mounted)setState(() { repos=rs.length; runs=rr; success=ss; loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
  @override Widget build(BuildContext c)=>shell('OVERVIEW','Dashboard','Your GitHub-connected build workspace.',loading?const Center(child:CircularProgressIndicator()):Column(children:[
   if(error.isNotEmpty) card(Text(error)),
   Row(children:[Expanded(child:card(_stat('Repositories','$repos'))),const SizedBox(width:12),Expanded(child:card(_stat('WyBuild runs','$runs'))),const SizedBox(width:12),Expanded(child:card(_stat('Successful','$success')))]),
@@ -252,16 +259,43 @@ class _ProjectsState extends State<Projects>{
 
 class Builds extends StatefulWidget {final Map<String,dynamic>? session;final VoidCallback onLogin;final void Function(String) snack;const Builds({super.key,this.session,required this.onLogin,required this.snack});@override State<Builds> createState()=>_BuildsState();}
 class _BuildsState extends State<Builds>{List runs=[];bool loading=true;String error='';Timer? timer;@override void initState(){super.initState();load();} @override void dispose(){timer?.cancel();super.dispose();}
-Future<void> load()async{if(widget.session==null){setState(()=>loading=false);return;}try{final rs=await api.call('/api/github/repos');final out=[];for(final r in rs){final x=await api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']});for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild')out.add({...w,'repo':r['full_name'],'repoName':r['name'],'owner':r['owner']['login']});}}out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
+Future<void> load()async{if(widget.session==null){setState(()=>loading=false);return;}try{final rs=await api.call('/api/github/repos');
+  // Same fix as Dashboard: query every repo's runs in parallel rather than
+  // awaiting them one by one, which is what made Builds slow to load once
+  // there were more than a couple of repositories.
+  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).then((x)=>{'repo':r,'data':x}).catchError((_)=>{'repo':r,'data':{'workflow_runs':[]}})));
+  final out=[];for(final res in results){final r=res['repo'];final x=res['data'];for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild')out.add({...w,'repo':r['full_name'],'repoName':r['name'],'owner':r['owner']['login']});}}
+  out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
 @override Widget build(BuildContext c){if(widget.session==null)return shell('HISTORY','Builds','Real GitHub Actions history.',card(Column(children:[const Text('Connect GitHub first'),const SizedBox(height:8),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));return shell('HISTORY','Builds','Showing WyBuild runs across your accessible repositories.',Column(children:[if(loading)const CircularProgressIndicator(),if(error.isNotEmpty)_notice(error),if(!loading&&runs.isEmpty)card(const Text('No WyBuild runs found. Start a build from Projects.')),for(final r in runs)RunCard(run:r,onRefresh:load,snack:widget.snack)]));}
 Widget _notice(String s)=>Padding(padding:const EdgeInsets.only(bottom:12),child:card(Text(s.replaceFirst('Exception: ',''))));
 }
 
 class RunCard extends StatefulWidget{final dynamic run;final Future<void> Function() onRefresh;final void Function(String) snack;const RunCard({super.key,required this.run,required this.onRefresh,required this.snack});@override State<RunCard> createState()=>_RunCardState();}
-class _RunCardState extends State<RunCard>{dynamic detail;bool busy=false;@override void initState(){super.initState();detail=widget.run;}Future<void> refresh()async{setState(()=>busy=true);try{detail=await api.call('/api/github/run',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});setState((){});}catch(e){widget.snack(e.toString());}finally{setState(()=>busy=false);}}
+class _RunCardState extends State<RunCard>{dynamic detail;bool busy=false;List artifactList=[];bool artifactsChecked=false;
+@override void initState(){super.initState();detail=widget.run;_maybeLoadArtifacts();}
+void _maybeLoadArtifacts(){if(detail['conclusion']=='success')_loadArtifacts();}
+// Fetched once up front (instead of only on click) so the correct
+// APK/AAB/Web button can be shown immediately and tapping it downloads
+// straight away with no extra round trip.
+Future<void> _loadArtifacts()async{try{final d=await api.call('/api/github/artifacts',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});if(mounted)setState((){artifactList=(d['artifacts']??[]) as List;artifactsChecked=true;});}catch(_){if(mounted)setState(()=>artifactsChecked=true);}}
+Future<void> refresh()async{setState(()=>busy=true);try{detail=await api.call('/api/github/run',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});artifactList=[];artifactsChecked=false;setState((){});_maybeLoadArtifacts();}catch(e){widget.snack(e.toString());}finally{setState(()=>busy=false);}}
 Future<void> rerun()async{try{await api.call('/api/github/rerun',method:'POST',body:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});await refresh();}catch(e){widget.snack(e.toString());}}
 Future<void> artifacts()async{try{final d=await api.call('/api/github/artifacts',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});showDialog(context:context,builder:(_)=>AlertDialog(title:const Text('Artifacts'),content:SizedBox(width:400,child:Wrap(spacing:8,runSpacing:8,children:[for(final a in d['artifacts']??[])btn('Download ${a['name']}',()=>html.window.location.assign('/api/github/artifact?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${a['id']}'))]))));}catch(e){widget.snack(e.toString());}}
-@override Widget build(BuildContext c)=>Padding(padding:const EdgeInsets.only(bottom:12),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Row(children:[Expanded(child:Text('${detail['name']} • ${widget.run['repo']}',style:const TextStyle(fontWeight:FontWeight.bold))),statusChip('${detail['conclusion']??detail['status']}')]),const SizedBox(height:7),Text(DateTime.parse(detail['created_at']).toLocal().toString(),style:const TextStyle(color:Colors.white54)),const SizedBox(height:12),Wrap(spacing:8,runSpacing:8,children:[btn(busy?'Refreshing…':'Refresh',busy?null:refresh,secondary:true,icon:Icons.refresh),if(detail['conclusion']=='failure')btn('Rebuild',rerun,secondary:true,icon:Icons.replay),btn('Artifacts',artifacts,secondary:true,icon:Icons.download),btn('Logs',()=>html.window.location.assign('/api/github/logs?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${widget.run['id']}'),secondary:true,icon:Icons.list_alt),if(detail['html_url']!=null)btn('GitHub',()=>html.window.location.assign(detail['html_url']),secondary:true,icon:Icons.open_in_new)]),])));
+void _download(dynamic a)=>html.window.location.assign('/api/github/artifact?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${a['id']}');
+// One button per artifact kind actually produced by this run (an 'auto'
+// build on a web project can yield both an APK and a web bundle), each
+// correctly labeled instead of a single button that always said "Download
+// APK" even when the run had produced an AAB or a web bundle.
+List<Widget> _downloadButtons(){
+ dynamic find(String needle)=>artifactList.cast<dynamic>().firstWhere((a)=>'${a['name']}'.toLowerCase().contains(needle),orElse:()=>null);
+ final apk=find('apk'),aab=find('aab'),web=find('web');
+ final out=<Widget>[];
+ if(apk!=null)out.add(btn('Download APK',()=>_download(apk),icon:Icons.android));
+ if(aab!=null)out.add(btn('Download AAB',()=>_download(aab),icon:Icons.inventory_2_outlined));
+ if(web!=null)out.add(btn('Download Web Build',()=>_download(web),icon:Icons.public));
+ return out;
+}
+@override Widget build(BuildContext c)=>Padding(padding:const EdgeInsets.only(bottom:12),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Row(children:[Expanded(child:Text('${detail['name']} • ${widget.run['repo']}',style:const TextStyle(fontWeight:FontWeight.bold))),statusChip('${detail['conclusion']??detail['status']}')]),const SizedBox(height:7),Text(DateTime.parse(detail['created_at']).toLocal().toString(),style:const TextStyle(color:Colors.white54)),const SizedBox(height:12),Wrap(spacing:8,runSpacing:8,children:[if(detail['conclusion']=='success'&&!artifactsChecked)const SizedBox(width:16,height:16,child:CircularProgressIndicator(strokeWidth:2)),..._downloadButtons(),btn(busy?'Refreshing…':'Refresh',busy?null:refresh,secondary:true,icon:Icons.refresh),if(detail['conclusion']=='failure')btn('Rebuild',rerun,secondary:true,icon:Icons.replay),btn('Artifacts',artifacts,secondary:true,icon:Icons.download),btn('Logs',()=>html.window.location.assign('/api/github/logs?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${widget.run['id']}'),secondary:true,icon:Icons.list_alt),if(detail['html_url']!=null)btn('GitHub',()=>html.window.location.assign(detail['html_url']),secondary:true,icon:Icons.open_in_new)]),])));
 }
 
 class Releases extends StatefulWidget{final Map<String,dynamic>? session;final VoidCallback onLogin;final void Function(String) snack;const Releases({super.key,this.session,required this.onLogin,required this.snack});@override State<Releases> createState()=>_ReleasesState();}
