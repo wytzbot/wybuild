@@ -235,7 +235,7 @@ class _ProjectsState extends State<Projects>{
       if(diagnosis!=null) _diagnosis(diagnosis!),
       const SizedBox(height:10),btn('Check Workflow',check,secondary:true,icon:Icons.fact_check_outlined),
       if(workflow!=null) ...[const SizedBox(height:12),Text('Workflow: ${workflow!['exists']==true?'installed':'not installed'} • ${workflow!['upToDate']==false?'update available':'current'}'),const SizedBox(height:10),
-        btn(workflow!['dispatchable']==true?'Workflow ready':'Install / update workflow',workflow!['dispatchable']==true?null:install,icon:Icons.settings_suggest),
+        btn((workflow!['dispatchable']==true&&workflow!['upToDate']!=false)?'Workflow ready':'Install / update workflow',(workflow!['dispatchable']==true&&workflow!['upToDate']!=false)?null:install,icon:Icons.settings_suggest),
       ],
     ])),
     const SizedBox(height:12),

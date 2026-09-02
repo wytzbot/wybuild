@@ -206,6 +206,21 @@ function safePart(value, label) {
   return value;
 }
 
+// Reads the WyBuild workflow file as installed on a given ref, or null if
+// it isn't there. Used to sanity-check a dispatch's inputs against what the
+// installed workflow actually declares - see github/rebuild below, which
+// hit "Unexpected inputs provided" from GitHub whenever a repo was still
+// running a workflow version installed before `native_features` existed.
+async function fetchWorkflowContent(owner, repo, ref, token) {
+  try {
+    const file = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, token);
+    return Buffer.from(file.content || '', 'base64').toString('utf8');
+  } catch (e) {
+    if (e.status === 404) return null;
+    throw e;
+  }
+}
+
 async function wydevEntitlement(s) {
   const api = process.env.WYDEV_BILLING_API_URL?.replace(/\/$/, '');
   if (!api) return { configured: false, plan: 'FREE', buildLimit: DEFAULT_FREE_LIMIT };
@@ -857,6 +872,27 @@ export default async function handler(req, res) {
         });
       }
       const nativeFeatures = normalizeNativeFeatures(b.native_features, plan);
+
+      // GitHub rejects a dispatch outright (400 "Unexpected inputs
+      // provided") if the workflow_dispatch inputs we send don't match what
+      // the installed wybuild.yml declares on this ref - which happens for
+      // any repo still on a workflow version older than when a given input
+      // was added. Check first and fail with a clear, actionable message
+      // instead of surfacing GitHub's raw validation error.
+      const workflowContent = await fetchWorkflowContent(owner, repo, ref, s.token);
+      if (!workflowContent) {
+        return json(res, 409, {
+          error: 'WyBuild workflow not found on this branch. Install it from the Projects tab first.',
+          code: 'WORKFLOW_NOT_INSTALLED'
+        });
+      }
+      if (!/^\s*native_features:/m.test(workflowContent)) {
+        return json(res, 409, {
+          error: 'This repository is running an outdated WyBuild workflow. Update it from the Projects tab, then build again.',
+          code: 'WORKFLOW_OUTDATED'
+        });
+      }
+
       await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/wybuild.yml/dispatches`, s.token, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
