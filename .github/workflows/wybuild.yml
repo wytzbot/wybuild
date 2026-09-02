@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 8
+# wybuild-workflow-version: 9
 name: WyBuild
 on:
   workflow_dispatch:
@@ -393,7 +393,7 @@ jobs:
           retention-days: 7
 
       - name: Upload APK
-        if: inputs.build_type == 'apk' || inputs.build_type == 'auto'
+        if: inputs.build_type == 'apk' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle'))
         uses: actions/upload-artifact@v6
         with:
           name: wybuild-apk-${{ github.run_number }}
