@@ -25,6 +25,18 @@ const STALE_ACTIVE_HOURS = 3;
 // independent of the monthly successful-build quota. Paid plans can run
 // several builds in parallel instead of waiting for one to finish.
 const PLAN_CONCURRENCY = { FREE: 1, PRO: 5, 'PRO+': 15, PROPLUS: 15 };
+
+// The Builds page is a history list, not an audit log - a build that failed
+// (bad gradlew, bad project structure, etc) has no ongoing value once it's
+// old. Auto-hide (never delete on GitHub) failed runs past this age so the
+// page doesn't grow unbounded with stale failures.
+const FAILED_RUN_HIDE_DAYS = 5;
+
+// Both the Dashboard and Builds page call GET /api/github/runs for every
+// repo the user can see, every time either page loads. Cache each
+// owner/repo's run list briefly in KV so navigating between the two (or
+// re-opening Builds) doesn't re-walk GitHub's pagination from scratch.
+const RUNS_CACHE_TTL_SECONDS = 20;
 const FREE_NATIVE_FEATURES = ['INTERNET', 'JAVASCRIPT', 'DOM_STORAGE', 'BACK_BUTTON', 'FILE_PICKER', 'SHARE', 'VIBRATION', 'ORIENTATION', 'BATTERY', 'NETWORK_STATUS', 'DEVICE_INFO', 'LOCAL_NOTIFICATIONS'];
 const PRO_NATIVE_FEATURES = ['CAMERA_MIC', 'LOCATION', 'DOWNLOADS', 'EXTERNAL_LINKS', 'FULLSCREEN', 'BIOMETRIC', 'SECURE_STORAGE', 'SCREEN_CAPTURE', 'PICTURE_IN_PICTURE', 'DEEP_LINKS'];
 const ALL_NATIVE_FEATURES = [...FREE_NATIVE_FEATURES, ...PRO_NATIVE_FEATURES];
@@ -290,6 +302,21 @@ async function countMonthlyBuilds(s) {
 // per-user, per-month counter in Vercel KV, keyed to the month the run was
 // originally created in (not the month it was deleted), so it lines up with
 // countMonthlyBuilds' own `created` filtering.
+// --- github/runs cache -----------------------------------------------------
+function runsCacheKey(login, owner, repo, created) {
+  return `wybuild:runs:${login}:${owner}/${repo}:${created || 'all'}`;
+}
+
+// Best-effort invalidation after anything that changes a repo's run list
+// (a new dispatch, a rerun, a delete), so the Builds page reflects the
+// change immediately instead of waiting out the short cache TTL. The
+// frontend never sends a `created` filter today, so clearing the 'all'
+// entry covers every real caller; a KV failure here just means the next
+// read is briefly stale, so it's swallowed rather than propagated.
+async function invalidateRunsCache(login, owner, repo) {
+  try { await kv.del(runsCacheKey(login, owner, repo, null)); } catch { /* best-effort */ }
+}
+
 function ledgerKey(login, date) {
   const d = new Date(date);
   const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
@@ -705,12 +732,45 @@ export default async function handler(req, res) {
       const r = safePart(u.searchParams.get('repo'), 'repo');
       const created = u.searchParams.get('created');
       const query = created ? `?created=${encodeURIComponent(created)}` : '';
-      const runs = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs${query}`, s.token, {
-        keyName: 'workflow_runs',
-        maxPages: MAX_RUN_PAGES,
-        perPage: 100
-      });
-      return json(res, 200, { total_count: runs.length, workflow_runs: runs });
+
+      const cacheKey = runsCacheKey(s.user.login, o, r, created);
+      const cached = await kv.get(cacheKey).catch(() => null);
+      if (cached) {
+        return json(res, 200, cached);
+      }
+
+      // Query the WyBuild workflow's own runs endpoint rather than every
+      // Actions run in the repo. Repos that also run other CI (tests, lint,
+      // release workflows, ...) were forcing us to page through all of that
+      // history just to throw most of it away in the `name === 'WyBuild'`
+      // filter the frontend used to do - this returns only WyBuild runs to
+      // begin with, so far fewer pages (often just one) are fetched.
+      let runs;
+      try {
+        runs = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/workflows/wybuild.yml/runs${query}`, s.token, {
+          keyName: 'workflow_runs',
+          maxPages: MAX_RUN_PAGES,
+          perPage: 100
+        });
+      } catch (e) {
+        // No wybuild.yml registered on this repo (never installed, or only
+        // committed to a branch that isn't the default yet) - zero runs
+        // rather than a 404 bubbling up to the Builds page.
+        if (e.status === 404) runs = [];
+        else throw e;
+      }
+
+      // Auto-hide (not delete) failed runs older than FAILED_RUN_HIDE_DAYS so
+      // they stop cluttering the Builds page. The underlying GitHub Actions
+      // run is untouched - this only affects what WyBuild displays.
+      const hideCutoff = Date.now() - FAILED_RUN_HIDE_DAYS * 86400000;
+      const visible = runs.filter(run => (
+        run.conclusion !== 'failure' || new Date(run.created_at).getTime() >= hideCutoff
+      ));
+
+      const payload = { total_count: visible.length, workflow_runs: visible };
+      await kv.set(cacheKey, payload, { ex: RUNS_CACHE_TTL_SECONDS }).catch(() => {});
+      return json(res, 200, payload);
     }
 
     if (req.method === 'GET' && route === 'github/run') {
@@ -743,6 +803,7 @@ export default async function handler(req, res) {
       }
 
       await gh(base, s.token, { method: 'DELETE' });
+      await invalidateRunsCache(s.user.login, owner, repo);
       return json(res, 200, { ok: true });
     }
 
@@ -801,6 +862,7 @@ export default async function handler(req, res) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ref, inputs: { build_type: buildType, build_mode: buildMode, native_features: nativeFeatures.join(',') } })
       });
+      await invalidateRunsCache(s.user.login, owner, repo);
       return json(res, 202, { ok: true, status: 'queued', nativeFeatures, buildLimit: limit, buildsUsed: usage.successful });
     }
 
@@ -813,6 +875,7 @@ export default async function handler(req, res) {
       // fresh dispatch, since GitHub's run object doesn't expose the original
       // inputs for us to replay via a new dispatch call.
       await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${encodeURIComponent(id)}/rerun`, s.token, { method: 'POST' });
+      await invalidateRunsCache(s.user.login, owner, repo);
       return json(res, 200, { ok: true });
     }
 
