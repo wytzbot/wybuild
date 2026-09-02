@@ -86,3 +86,14 @@ WyDev remains the server-side billing authority. WyBuild enforces build limits i
 
 ## Cost model
 WyBuild uses GitHub Actions and the Android/Flutter toolchains already available in CI. WyBuild does not add paid Android SDK libraries or paid native plugins. GitHub Actions usage and any third-party billing plan limits still apply; the service cannot guarantee zero infrastructure cost at arbitrary scale.
+
+## Android release signing
+
+WyBuild signs release APK/AAB artifacts after the Android build. For production apps and Play Store updates, configure these GitHub Actions repository secrets in every target repository:
+
+- `ANDROID_KEYSTORE_BASE64` — base64-encoded JKS/PKCS12 keystore
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
+- `ANDROID_STORE_PASSWORD`
+
+If these are absent, WyBuild generates a temporary release key so the artifact is still signed, but that key is intentionally not persistent and must not be used for production update continuity.

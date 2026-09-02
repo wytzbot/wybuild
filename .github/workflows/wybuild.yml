@@ -319,6 +319,61 @@ jobs:
             ./gradlew assembleRelease --no-daemon --stacktrace
           fi
 
+      - name: Sign Android release artifacts
+        if: (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto') && inputs.build_mode == 'release' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle' || steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla')
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          command -v keytool >/dev/null
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && [ -n "${ANDROID_KEY_ALIAS:-}" ] && [ -n "${ANDROID_KEY_PASSWORD:-}" ] && [ -n "${ANDROID_STORE_PASSWORD:-}" ]; then
+            echo "Using persistent WyBuild signing key from GitHub Actions secrets."
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > /tmp/wybuild-release.jks
+            KEYSTORE=/tmp/wybuild-release.jks
+            ALIAS="$ANDROID_KEY_ALIAS"
+            KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
+            STORE_PASSWORD="$ANDROID_STORE_PASSWORD"
+          else
+            echo "::warning title=Temporary signing key::Persistent signing secrets are not configured. A temporary release key will be generated for this build. Apps signed this way cannot receive seamless future updates under the same signing identity. Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD and ANDROID_STORE_PASSWORD for production releases."
+            KEYSTORE=/tmp/wybuild-release.jks
+            keytool -genkeypair -v -keystore "$KEYSTORE" -storepass wybuild-temp-store -keypass wybuild-temp-key -alias wybuild -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=WyBuild Release, O=WyBuild, C=NG"
+            ALIAS=wybuild
+            KEY_PASSWORD=wybuild-temp-key
+            STORE_PASSWORD=wybuild-temp-store
+          fi
+
+          sign_apks() {
+            local tool=""
+            tool="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+            if [ -z "$tool" ]; then echo "::error::Android apksigner was not found."; exit 1; fi
+            while IFS= read -r -d '' apk; do
+              echo "Signing APK: $apk"
+              "$tool" sign --ks "$KEYSTORE" --ks-key-alias "$ALIAS" --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" "$apk"
+              "$tool" verify --verbose "$apk" >/dev/null
+            done < <(find . -type f -name '*.apk' -path '*/build/outputs/apk/*' -print0)
+          }
+
+          sign_aabs() {
+            while IFS= read -r -d '' aab; do
+              echo "Signing AAB: $aab"
+              jarsigner -keystore "$KEYSTORE" -storepass "$STORE_PASSWORD" -keypass "$KEY_PASSWORD" -sigalg SHA256withRSA -digestalg SHA-256 "$aab" "$ALIAS"
+              jarsigner -verify -strict "$aab" >/dev/null
+            done < <(find . -type f -name '*.aab' -path '*/build/outputs/bundle/*' -print0)
+          }
+
+          if [ "${{ inputs.build_type }}" = "aab" ]; then
+            sign_aabs
+          elif [ "${{ inputs.build_type }}" = "apk" ]; then
+            sign_apks
+          else
+            sign_apks
+            sign_aabs
+          fi
+
       - name: Build Next.js web package
         if: steps.detect.outputs.type == 'next' && (inputs.build_type == 'web' || inputs.build_type == 'auto')
         shell: bash
