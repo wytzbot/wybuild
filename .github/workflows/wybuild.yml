@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 14
+# wybuild-workflow-version: 15
 name: WyBuild
 on:
   workflow_dispatch:
@@ -255,6 +255,10 @@ jobs:
           rootProject.name = "WyBuildWebWrapper"
           include(":app")
           EOF
+          cat > wybuild-wrapper/gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=false
+          EOF
           cat > wybuild-wrapper/build.gradle <<'EOF'
           plugins { id 'com.android.application' version '8.7.3' apply false }
           EOF
@@ -263,7 +267,7 @@ jobs:
           android { namespace 'com.wybuild.wrapper'; compileSdk 35
             defaultConfig { applicationId 'com.wybuild.wrapper'; minSdk 23; targetSdk 35; versionCode 1; versionName '1.0' }
           }
-          dependencies { implementation "androidx.biometric:biometric:1.1.0" }
+          dependencies { $BIOMETRIC_DEP }
           EOF
           cat > wybuild-wrapper/app/src/main/res/values/styles.xml <<'EOF'
           <resources><style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#4F46E5</item></style></resources>
