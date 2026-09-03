@@ -1111,6 +1111,24 @@ export default async function handler(req, res) {
       }
 
       try {
+        // Same guard as github/rebuild: a repo can be "dispatchable" (the
+        // workflow is registered and active) while still running a version
+        // installed long before native_features existed - or, as seen on
+        // very old installs, before per-project-type detection existed at
+        // all (just a root-only `[ -f ./gradlew ]` check). GitHub's dispatch
+        // call succeeds either way since native_features is sent as a plain
+        // string input; the workflow itself then runs its old, narrower
+        // logic and fails on validation instead of building. Catch that
+        // here with an actionable message rather than letting it burn a
+        // build slot on a doomed run.
+        const workflowContent = await fetchWorkflowContent(owner, repo, ref, s.token);
+        if (!workflowContent) {
+          return json(res, 409, { error: 'WyBuild workflow not found on this branch. Install it from the Projects tab first.', code: 'WORKFLOW_NOT_INSTALLED' });
+        }
+        if (!/^\s*native_features:/m.test(workflowContent)) {
+          return json(res, 409, { error: 'This repository is running an outdated WyBuild workflow. Update it from the Projects tab, then build again.', code: 'WORKFLOW_OUTDATED' });
+        }
+
         await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/wybuild.yml/dispatches`, s.token, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
