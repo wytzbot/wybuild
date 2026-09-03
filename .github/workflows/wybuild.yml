@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 13
+# wybuild-workflow-version: 14
 name: WyBuild
 on:
   workflow_dispatch:
@@ -91,13 +91,20 @@ jobs:
             exit 1
           fi
 
-      - name: Set up Java
-        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle' || ((inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto') && (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))
+      - name: Set up Java for Android projects
+        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle'
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
+
+      - name: Set up Java for Web wrapper
+        if: (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto') && (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla')
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Set up Flutter
         if: steps.detect.outputs.type == 'flutter'
