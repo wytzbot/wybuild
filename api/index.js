@@ -1134,6 +1134,7 @@ export default async function handler(req, res) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ref, inputs: { build_type: buildType, build_mode: buildMode, native_features: nativeFeatures.join(',') } })
         });
+        await invalidateRunsCache(s.user.login, owner, repo);
       } catch (e) {
         if (e.status === 404) return json(res, 409, { error: 'WyBuild workflow is not installed on this branch. Install it first.', code: 'WORKFLOW_MISSING' });
         if (e.status === 403) return json(res, 403, { error: 'GitHub denied workflow execution. Re-authorize WyBuild with the required repository permissions.', code: 'GITHUB_PERMISSION_DENIED' });
