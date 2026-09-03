@@ -279,19 +279,18 @@ class _ProjectsState extends State<Projects>{
 }
 
 class Builds extends StatefulWidget {final Map<String,dynamic>? session;final VoidCallback onLogin;final void Function(String) snack;const Builds({super.key,this.session,required this.onLogin,required this.snack});@override State<Builds> createState()=>_BuildsState();}
-class _BuildsState extends State<Builds>{List runs=[];bool loading=true;String error='';Timer? timer;@override void initState(){super.initState();load();} @override void dispose(){timer?.cancel();super.dispose();}
+class _BuildsState extends State<Builds>{List runs=[];bool loading=true;String error='';Timer? timer;@override void initState(){super.initState();load();timer=Timer.periodic(const Duration(seconds:15),(_){if(mounted&&!loading)load();});} @override void dispose(){timer?.cancel();super.dispose();}
 Future<void> load()async{if(widget.session==null){setState(()=>loading=false);return;}try{final rs=await api.call('/api/github/repos');
-  // Same fix as Dashboard: query every repo's runs in parallel rather than
-  // awaiting them one by one, which is what made Builds slow to load once
-  // there were more than a couple of repositories.
-  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).then((x)=>{'repo':r,'data':x}).catchError((_)=>{'repo':r,'data':{'workflow_runs':[]}})));
-  final out=[];for(final res in results){final r=res['repo'];final x=res['data'];for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild')out.add({...w,'repo':r['full_name'],'repoName':r['name'],'owner':r['owner']['login']});}}
-  out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
+  // Query every repo in parallel so newly dispatched runs appear quickly.
+  // The API endpoint is already scoped to wybuild.yml, so do not discard
+  // runs based on the workflow display name.
+  final failures=<String>[];
+  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).then((x)=>{'repo':r,'data':x}).catchError((_) { failures.add(r['full_name'] as String); return {'repo':r,'data':{'workflow_runs':[]}}; })));
+  final out=[];for(final res in results){final r=res['repo'];final x=res['data'];for(final w in (x['workflow_runs']??[])){out.add({...w,'repo':r['full_name'],'repoName':r['name'],'owner':r['owner']['login']});}}
+  out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; error=failures.isEmpty?'':'Could not load runs for: ${failures.join(', ')}'; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
 @override Widget build(BuildContext c){if(widget.session==null)return shell('HISTORY','Builds','Real GitHub Actions history.',card(Column(children:[const Text('Connect GitHub first'),const SizedBox(height:8),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));return shell('HISTORY','Builds','Showing WyBuild runs across your accessible repositories.',Column(children:[
-  // No auto-polling here on purpose (avoid hammering the GitHub API from an
-  // open tab) - but there was previously no way at all to pull in a build
-  // started after this page first loaded, short of navigating away and
-  // back. Explicit refresh closes that gap.
+  // Poll lightly while Builds is open so queued/in-progress runs appear
+  // automatically. The explicit refresh button remains available.
   Align(alignment:Alignment.centerRight,child:btn(loading?'Refreshing…':'Refresh list',loading?null:load,secondary:true,icon:Icons.refresh)),
   const SizedBox(height:12),
   if(loading)const CircularProgressIndicator(),if(error.isNotEmpty)_notice(error),if(!loading&&runs.isEmpty)card(const Text('No WyBuild runs found. Start a build from Projects.')),for(final r in runs)RunCard(run:r,onRefresh:load,snack:widget.snack)]));}
