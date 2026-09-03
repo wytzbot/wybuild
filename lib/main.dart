@@ -287,7 +287,14 @@ Future<void> load()async{if(widget.session==null){setState(()=>loading=false);re
   final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).then((x)=>{'repo':r,'data':x}).catchError((_)=>{'repo':r,'data':{'workflow_runs':[]}})));
   final out=[];for(final res in results){final r=res['repo'];final x=res['data'];for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild')out.add({...w,'repo':r['full_name'],'repoName':r['name'],'owner':r['owner']['login']});}}
   out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
-@override Widget build(BuildContext c){if(widget.session==null)return shell('HISTORY','Builds','Real GitHub Actions history.',card(Column(children:[const Text('Connect GitHub first'),const SizedBox(height:8),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));return shell('HISTORY','Builds','Showing WyBuild runs across your accessible repositories.',Column(children:[if(loading)const CircularProgressIndicator(),if(error.isNotEmpty)_notice(error),if(!loading&&runs.isEmpty)card(const Text('No WyBuild runs found. Start a build from Projects.')),for(final r in runs)RunCard(run:r,onRefresh:load,snack:widget.snack)]));}
+@override Widget build(BuildContext c){if(widget.session==null)return shell('HISTORY','Builds','Real GitHub Actions history.',card(Column(children:[const Text('Connect GitHub first'),const SizedBox(height:8),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));return shell('HISTORY','Builds','Showing WyBuild runs across your accessible repositories.',Column(children:[
+  // No auto-polling here on purpose (avoid hammering the GitHub API from an
+  // open tab) - but there was previously no way at all to pull in a build
+  // started after this page first loaded, short of navigating away and
+  // back. Explicit refresh closes that gap.
+  Align(alignment:Alignment.centerRight,child:btn(loading?'Refreshing…':'Refresh list',loading?null:load,secondary:true,icon:Icons.refresh)),
+  const SizedBox(height:12),
+  if(loading)const CircularProgressIndicator(),if(error.isNotEmpty)_notice(error),if(!loading&&runs.isEmpty)card(const Text('No WyBuild runs found. Start a build from Projects.')),for(final r in runs)RunCard(run:r,onRefresh:load,snack:widget.snack)]));}
 Widget _notice(String s)=>Padding(padding:const EdgeInsets.only(bottom:12),child:card(Text(s.replaceFirst('Exception: ',''))));
 }
 
