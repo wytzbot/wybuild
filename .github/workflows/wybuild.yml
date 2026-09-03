@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 11
+# wybuild-workflow-version: 12
 name: WyBuild
 on:
   workflow_dispatch:
@@ -92,7 +92,7 @@ jobs:
           fi
 
       - name: Set up Java
-        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle' || ((inputs.build_type == 'apk' || inputs.build_type == 'aab') && (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))
+        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle' || ((inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto') && (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))
         uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -183,7 +183,7 @@ jobs:
           }
 
       - name: Build Web to Android APK wrapper
-        if: (inputs.build_type == 'apk' || inputs.build_type == 'aab') && (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla')
+        if: (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto') && (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla')
         shell: bash
         env:
           FEATURES: ${{ inputs.native_features }}
@@ -396,7 +396,7 @@ jobs:
           retention-days: 7
 
       - name: Upload APK
-        if: inputs.build_type == 'apk' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle'))
+        if: inputs.build_type == 'apk' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle' || steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))
         uses: actions/upload-artifact@v6
         with:
           name: wybuild-apk-${{ github.run_number }}

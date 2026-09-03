@@ -325,7 +325,8 @@ Future<void> rebuildCurrent()async{
     await widget.onRefresh();
   }catch(e){widget.snack(e.toString());}
 }
-Future<void> artifacts()async{try{final d=await api.call('/api/github/artifacts',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});showDialog(context:context,builder:(_)=>AlertDialog(title:const Text('Artifacts'),content:SizedBox(width:400,child:Wrap(spacing:8,runSpacing:8,children:[for(final a in d['artifacts']??[])btn('Download ${a['name']}',()=>web.window.location.assign('/api/github/artifact?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${a['id']}'))]))));}catch(e){widget.snack(e.toString());}}
+Widget _artifactButton(dynamic a){final n='${a['name']}';final isWeb=n.toLowerCase().contains('web');return btn(isWeb?'Download Web Build':'Download $n',()=>web.window.location.assign('/api/github/artifact?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${a['id']}'));}
+Future<void> artifacts()async{try{final d=await api.call('/api/github/artifacts',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});showDialog(context:context,builder:(_)=>AlertDialog(title:const Text('Artifacts'),content:SizedBox(width:400,child:Wrap(spacing:8,runSpacing:8,children:[for(final a in (d['artifacts']??[]) as List)_artifactButton(a)]))));}catch(e){widget.snack(e.toString());}}
 void _download(dynamic a)=>web.window.location.assign('/api/github/artifact?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${a['id']}');
 // One button per artifact kind actually produced by this run (an 'auto'
 // build on a web project can yield both an APK and a web bundle), each
