@@ -56,6 +56,7 @@ class _WyBuildAppState extends State<WyBuildApp> {
     ('releases','Releases',Icons.rocket_launch_outlined),
     ('docs','Docs & Guide',Icons.menu_book_outlined),
     ('features','Build Features',Icons.auto_awesome_outlined),
+    ('native-features','Native Features',Icons.extension_outlined),
     ('billing','Billing',Icons.credit_card_outlined),
     ('settings','Settings',Icons.settings_outlined),
     ('help','Help',Icons.help_outline),
@@ -128,11 +129,12 @@ class _WyBuildAppState extends State<WyBuildApp> {
     if (page=='home') return Home(onLogin:api.login, go:go);
     switch(page) {
       case 'dashboard': return Dashboard(session:session, go:go);
-      case 'projects': return Projects(session:session, onLogin:api.login, snack:snack);
+      case 'projects': return Projects(session:session, onLogin:api.login, snack:snack, go:go);
       case 'builds': return Builds(session:session, onLogin:api.login, snack:snack);
       case 'releases': return Releases(session:session, onLogin:api.login, snack:snack);
       case 'docs': return Docs();
       case 'features': return Features();
+      case 'native-features': return NativeFeatures();
       case 'billing': return Billing(session:session, onLogin:api.login, snack:snack);
       case 'settings': return Settings(session:session, onLogin:api.login, snack:snack);
       case 'help': return Help(go:go);
@@ -200,12 +202,12 @@ class _DashboardState extends State<Dashboard>{
 }
 
 class Projects extends StatefulWidget {
- final Map<String,dynamic>? session; final VoidCallback onLogin; final void Function(String) snack;
- const Projects({super.key,this.session,required this.onLogin,required this.snack});
+ final Map<String,dynamic>? session; final VoidCallback onLogin; final void Function(String) snack; final void Function(String) go;
+ const Projects({super.key,this.session,required this.onLogin,required this.snack,required this.go});
  @override State<Projects> createState()=>_ProjectsState();
 }
 class _ProjectsState extends State<Projects>{
- List repos=[]; List branches=[]; Map<String,dynamic>? repo; String branch=''; String target='auto'; bool loading=false,setup=false,checking=false; Map<String,dynamic>? workflow,diagnosis; String error='',message=''; String plan='FREE'; bool planLoading=false; final Set<String> selectedProFeatures=<String>{}; final freeFeatures=<String>['INTERNET','JAVASCRIPT','DOM_STORAGE','BACK_BUTTON','FILE_PICKER','SHARE','VIBRATION','ORIENTATION','BATTERY','NETWORK_STATUS','DEVICE_INFO','LOCAL_NOTIFICATIONS']; final proFeatures=<String>['CAMERA_MIC','LOCATION','DOWNLOADS','EXTERNAL_LINKS','FULLSCREEN','BIOMETRIC','SECURE_STORAGE','SCREEN_CAPTURE','PICTURE_IN_PICTURE','DEEP_LINKS']; String _nativeFeatureString()=>[...freeFeatures,...((plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?selectedProFeatures:<String>{})].join(',');
+ List repos=[]; List branches=[]; Map<String,dynamic>? repo; String branch=''; String target='auto'; bool loading=false,setup=false,checking=false,featuresOpen=false; Map<String,dynamic>? workflow,diagnosis; String error='',message=''; String plan='FREE'; bool planLoading=false; final Set<String> selectedProFeatures=<String>{}; final freeFeatures=<String>['INTERNET','JAVASCRIPT','DOM_STORAGE','BACK_BUTTON','FILE_PICKER','SHARE','VIBRATION','ORIENTATION','BATTERY','NETWORK_STATUS','DEVICE_INFO','LOCAL_NOTIFICATIONS']; final proFeatures=<String>['CAMERA_MIC','LOCATION','DOWNLOADS','EXTERNAL_LINKS','FULLSCREEN','BIOMETRIC','SECURE_STORAGE','SCREEN_CAPTURE','PICTURE_IN_PICTURE','DEEP_LINKS']; String _nativeFeatureString()=>[...freeFeatures,...((plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?selectedProFeatures:<String>{})].join(',');
  final targets={'auto':('Auto Detect','auto','release'),'debug':('Android APK • Debug','apk','debug'),'apk':('Android APK • Release','apk','release'),'aab':('Android AAB • Play Store','aab','release'),'web':('Web App','web','release'),'webapk':('Web → Android APK','apk','release'),'webaab':('Web → Android AAB','aab','release')};
  @override void initState(){super.initState();if(widget.session!=null){loadRepos();loadPlan();}}
   Future<void> loadPlan() async {setState(()=>planLoading=true);try{final x=await api.call('/api/billing/status');if(mounted)setState(()=>plan=(x['plan']?.toString() ?? 'FREE').toUpperCase());}catch(_){ }finally{if(mounted)setState(()=>planLoading=false);}}
@@ -268,18 +270,58 @@ class _ProjectsState extends State<Projects>{
       DropdownButtonFormField<String>(value:target,decoration:const InputDecoration(labelText:'What do you want?'),items:targets.entries.map((e)=>DropdownMenuItem(value:e.key,child:Text(e.value.$1))).toList(),onChanged:(v)=>setState(()=>target=v??'auto')),
       if(target=='webapk'||target=='webaab') ...[
         const SizedBox(height:12),
-        Text('Native features • ${planLoading?'checking plan':plan}',style:const TextStyle(fontSize:16,fontWeight:FontWeight.bold)),
-        const SizedBox(height:4),
-        const Text('Free features are added automatically. Pro features can be selected only after the server verifies your premium entitlement.',style:TextStyle(color:Colors.white60)),
-        const SizedBox(height:8),
-        Wrap(spacing:8,runSpacing:4,children:[
-          for(final f in freeFeatures) Chip(label:Text('✓ ${f.replaceAll('_',' ')}'),avatar:const Icon(Icons.check,size:14)),
-          for(final f in proFeatures) FilterChip(
-            label:Text(f.replaceAll('_',' ')),
-            selected:selectedProFeatures.contains(f),
-            onSelected:(plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?(v)=>setState(()=>v?selectedProFeatures.add(f):selectedProFeatures.remove(f)):null,
-          )
+        Row(children:[
+          Expanded(child:Text('Native features • ${planLoading?'checking plan':plan}',style:const TextStyle(fontSize:16,fontWeight:FontWeight.bold))),
+          TextButton.icon(onPressed:()=>widget.go('native-features'),icon:const Icon(Icons.info_outline,size:16),label:const Text('How each one works')),
         ]),
+        const SizedBox(height:4),
+        const Text('Free features are always included. Pro features need a verified Pro/Pro+ plan. Open the picker to see and choose exactly what ships in the app.',style:TextStyle(color:Colors.white60)),
+        const SizedBox(height:8),
+        // Dropdown-style feature picker: a summary bar that expands into a
+        // checkbox list (free features locked-on, Pro features toggleable
+        // only for a verified Pro/Pro+ plan), so developers can see exactly
+        // what's included before building instead of guessing from chips.
+        InkWell(
+          onTap:()=>setState(()=>featuresOpen=!featuresOpen),
+          borderRadius:BorderRadius.circular(8),
+          child:Container(
+            padding:const EdgeInsets.symmetric(horizontal:14,vertical:12),
+            decoration:BoxDecoration(color:const Color(0xFF11151D),borderRadius:BorderRadius.circular(8),border:Border.all(color:const Color(0xFF242936))),
+            child:Row(children:[
+              const Icon(Icons.tune,size:18,color:Colors.white60),
+              const SizedBox(width:10),
+              Expanded(child:Text('${freeFeatures.length + selectedProFeatures.length} of ${freeFeatures.length + proFeatures.length} native features selected')),
+              Icon(featuresOpen?Icons.expand_less:Icons.expand_more),
+            ]),
+          ),
+        ),
+        if(featuresOpen) Container(
+          margin:const EdgeInsets.only(top:8),
+          decoration:BoxDecoration(border:Border.all(color:const Color(0xFF242936)),borderRadius:BorderRadius.circular(8)),
+          child:Column(children:[
+            const Padding(padding:EdgeInsets.fromLTRB(16,10,16,4),child:Align(alignment:Alignment.centerLeft,child:Text('FREE • always included',style:TextStyle(fontSize:11,fontWeight:FontWeight.bold,color:Colors.white38,letterSpacing:1)))),
+            for(final f in freeFeatures) CheckboxListTile(
+              dense:true,
+              controlAffinity:ListTileControlAffinity.leading,
+              value:true,
+              onChanged:null,
+              secondary:const Icon(Icons.check_circle_outline,size:18,color:Colors.greenAccent),
+              title:Text(f.replaceAll('_',' ')),
+              subtitle:Text(featureShort(f),style:const TextStyle(fontSize:12)),
+            ),
+            const Divider(height:1),
+            Padding(padding:const EdgeInsets.fromLTRB(16,10,16,4),child:Align(alignment:Alignment.centerLeft,child:Text('PRO • ${(plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?'select what you need':'requires Pro or Pro+'}',style:const TextStyle(fontSize:11,fontWeight:FontWeight.bold,color:Colors.white38,letterSpacing:1)))),
+            for(final f in proFeatures) CheckboxListTile(
+              dense:true,
+              controlAffinity:ListTileControlAffinity.leading,
+              value:selectedProFeatures.contains(f),
+              onChanged:(plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?(v)=>setState(()=>v==true?selectedProFeatures.add(f):selectedProFeatures.remove(f)):null,
+              secondary:Icon(Icons.workspace_premium_outlined,size:18,color:(plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?Colors.amber:Colors.white24),
+              title:Text(f.replaceAll('_',' '),style:TextStyle(color:(plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?null:Colors.white38)),
+              subtitle:Text(featureShort(f),style:const TextStyle(fontSize:12)),
+            ),
+          ]),
+        ),
         const SizedBox(height:8),
         if(plan=='PRO'||plan=='PRO+'||plan=='PROPLUS') OutlinedButton.icon(
           onPressed:()=>setState(()=>selectedProFeatures.addAll({'CAMERA_MIC','LOCATION','DOWNLOADS','SHARE','VIBRATION','BATTERY','NETWORK_STATUS','DEVICE_INFO','LOCAL_NOTIFICATIONS'})),
@@ -375,6 +417,67 @@ Future<void>create()async{if(repo.isEmpty||tag.trim().isEmpty)return;setState(()
 
 class Docs extends StatefulWidget{const Docs({super.key});@override State<Docs>createState()=>_DocsState();}
 class _DocsState extends State<Docs>{String q='';final items=[['Getting Started','Connect GitHub, select a repository, let Project Doctor inspect it, install the workflow and start a build.'],['Automatic setup','WyBuild can add its GitHub Actions workflow through a setup branch and pull request. You do not need to hand-write YAML.'],['Web → Android APK','Static Vite/React/HTML output can be copied into a generated Android WebView project during CI, then Gradle produces the APK.'],['Flutter','Flutter projects use the stable Flutter toolchain and can produce APK or AAB artifacts.'],['Android/Gradle','Existing Android projects use their own Gradle wrapper and project configuration.'],['Build logs','Logs come from the original GitHub Actions run, so dependency and Gradle errors are not hidden.'],['Signing','Release signing should be supplied through encrypted CI secrets. Never put keystores or passwords in frontend code.'],['Billing','WyDev remains the server-side billing authority. The frontend never proves payment by itself.'],['Security','GitHub OAuth is used instead of asking users to paste personal access tokens.']];@override Widget build(BuildContext c){final f=items.where((x)=>(x[0]+' '+x[1]).toLowerCase().contains(q.toLowerCase())).toList();return shell('DOCUMENTATION','Docs & Guide','Understand the complete WyBuild flow.',Column(children:[TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search documentation'),onChanged:(v)=>setState(()=>q=v)),const SizedBox(height:12),for(final x in f)Padding(padding:const EdgeInsets.only(bottom:10),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(x[0],style:const TextStyle(fontWeight:FontWeight.bold,fontSize:17)),const SizedBox(height:6),Text(x[1],style:const TextStyle(color:Colors.white60))])))]));}}
+
+// Single source of truth for every selectable native feature: which plan
+// tier it needs, a one-line summary (used as a checkbox subtitle on the
+// Projects build page) and a longer technical explanation of how WyBuild
+// actually implements it in the generated Android wrapper (used on the
+// Native Features reference page). Order and FREE/PRO tiers mirror
+// FREE_NATIVE_FEATURES / PRO_NATIVE_FEATURES in api/index.js.
+class NativeFeature{final String key,tier,title,short,long;const NativeFeature(this.key,this.tier,this.title,this.short,this.long);}
+const List<NativeFeature> nativeFeatureCatalog=[
+  NativeFeature('INTERNET','FREE','Internet access','Required base permission so the app can load your web content.','WyBuild always adds the INTERNET permission and enables WebView networking, so the generated app can load your bundled web assets and reach any APIs your app calls. This is not optional - every wrapped app needs it.'),
+  NativeFeature('JAVASCRIPT','FREE','JavaScript execution','Runs your app\'s JavaScript inside the WebView.','Enables JavaScript execution in the Android WebView (WebSettings.setJavaScriptEnabled). Almost every modern web app needs this to function, so it is on by default.'),
+  NativeFeature('DOM_STORAGE','FREE','DOM storage','Enables localStorage/sessionStorage for your web app.','Turns on DOM storage (setDomStorageEnabled) so code that relies on localStorage or sessionStorage keeps working the same way it does in a browser tab.'),
+  NativeFeature('BACK_BUTTON','FREE','Back button handling','Android back gesture navigates your app\'s history first.','The wrapper\'s onBackPressed override checks whether the WebView can go back in its own history and does that before falling back to closing the app, matching normal browser-back behavior.'),
+  NativeFeature('FILE_PICKER','FREE','File picker','Native file chooser for <input type=file> uploads.','Implements onShowFileChooser so any HTML file input opens the standard Android file/photo picker and returns the selected file to your page, instead of doing nothing.'),
+  NativeFeature('SHARE','FREE','Native share sheet','Bridge call opens the native Android share sheet.','Exposes WyBuild.share(text) to your JavaScript, which opens Android\'s native share sheet (Intent.ACTION_SEND) so users can send text to other apps.'),
+  NativeFeature('VIBRATION','FREE','Vibration','Bridge call triggers short device vibration.','Exposes WyBuild.vibrate(ms) (clamped to 2 seconds) and adds the VIBRATE permission, letting your JS trigger haptic feedback on supported devices.'),
+  NativeFeature('ORIENTATION','FREE','Orientation lock','Bridge call locks or unlocks screen orientation.','Exposes WyBuild.setOrientation(\'portrait\'|\'landscape\'|\'auto\') to lock the activity to a specific orientation or return it to following the device sensor.'),
+  NativeFeature('BATTERY','FREE','Battery level','Bridge call returns current battery percentage.','Exposes WyBuild.battery(), reading the device\'s BatteryManager to return the current charge percentage as a string to your JS.'),
+  NativeFeature('NETWORK_STATUS','FREE','Network status','Bridge call reports wifi / cellular / offline.','Exposes WyBuild.network(), using ConnectivityManager to tell your JS whether the device is on wifi, cellular data, or offline.'),
+  NativeFeature('DEVICE_INFO','FREE','Device info','Bridge call returns manufacturer, model, Android version.','Exposes WyBuild.device(), returning a string like "Samsung SM-G991B Android 14" so your app can tailor behavior or diagnostics to the device.'),
+  NativeFeature('LOCAL_NOTIFICATIONS','FREE','Local notifications','Bridge call posts a local Android notification.','Exposes WyBuild.notify(title,text) and adds POST_NOTIFICATIONS (Android 13+), creating a notification channel and posting a simple local notification from your JS.'),
+  NativeFeature('CAMERA_MIC','PRO','Camera & microphone','Camera + microphone access for getUserMedia.','Adds CAMERA and RECORD_AUDIO permissions, requests them at launch, and auto-grants WebView permission prompts so navigator.mediaDevices.getUserMedia() works for camera/mic capture in your web app.'),
+  NativeFeature('LOCATION','PRO','Location (GPS)','GPS access for the browser Geolocation API.','Adds ACCESS_FINE_LOCATION and ACCESS_COARSE_LOCATION, requests them at launch, and auto-approves WebView geolocation prompts so navigator.geolocation works without a native permission dialog blocking it.'),
+  NativeFeature('DOWNLOADS','PRO','File downloads','Lets the WebView hand off file downloads.','Registers a DownloadListener that opens a download URL as a system Intent, so files your web app links to open in an external app/browser instead of silently failing inside the WebView.'),
+  NativeFeature('EXTERNAL_LINKS','PRO','External links','http(s) links open in the device\'s default browser.','Overrides WebView URL loading so any http/https link is handed to the system\'s default browser via an Intent, keeping your in-app WebView scoped to your own content.'),
+  NativeFeature('FULLSCREEN','PRO','Fullscreen UI','Hides the status/nav bars for an immersive UI.','Sets Android\'s immersive system UI visibility flags so the status bar and navigation bar are hidden, giving the app a fullscreen, more native feel.'),
+  NativeFeature('BIOMETRIC','PRO','Biometric auth','Bridge call triggers fingerprint/face unlock.','Exposes WyBuild.biometric(), which shows Android\'s BiometricPrompt (fingerprint or face unlock) using androidx.biometric, so your web app can gate a screen or action behind device biometrics.'),
+  NativeFeature('SECURE_STORAGE','PRO','Secure storage','Encrypted on-device key/value storage.','Exposes WyBuild.securePut/secureGet/secureRemove, which AES-GCM encrypt values with a key held in the Android Keystore before saving them to SharedPreferences - useful for tokens or secrets you do not want in plain localStorage.'),
+  NativeFeature('SCREEN_CAPTURE','PRO','Screenshot protection','Blocks screenshots and screen recording.','Sets FLAG_SECURE on the app window, which prevents the OS from taking screenshots or screen-recording the app - useful for screens showing sensitive data. Despite the generic name, selecting this restricts capture rather than enabling it.'),
+  NativeFeature('PICTURE_IN_PICTURE','PRO','Picture-in-picture','Bridge call enters Android Picture-in-Picture mode.','Exposes WyBuild.enterPictureInPicture() (Android 8+) and marks the activity as PiP-capable, so video or call-style content can shrink to a floating window when the user leaves the app.'),
+  NativeFeature('DEEP_LINKS','PRO','Deep links','Registers a wybuild:// deep-link scheme.','Adds a wybuild:// intent filter to the manifest and handles it in the WebView\'s URL loading override, so external links or notifications can open directly into a specific spot in your app.'),
+];
+String featureShort(String key)=>nativeFeatureCatalog.firstWhere((f)=>f.key==key,orElse:()=>NativeFeature(key,'FREE',key,'','')).short;
+
+class NativeFeatures extends StatefulWidget{const NativeFeatures({super.key});@override State<NativeFeatures>createState()=>_NativeFeaturesState();}
+class _NativeFeaturesState extends State<NativeFeatures>{String q='';String? open;
+bool _matches(NativeFeature f)=>('${f.title} ${f.short} ${f.long}').toLowerCase().contains(q.toLowerCase());
+Widget _row(NativeFeature f)=>card(Column(children:[
+  ListTile(
+    onTap:()=>setState(()=>open=open==f.key?null:f.key),
+    leading:Icon(f.tier=='FREE'?Icons.check_circle_outline:Icons.workspace_premium_outlined,color:f.tier=='FREE'?Colors.greenAccent:Colors.amber),
+    title:Text(f.title,style:const TextStyle(fontWeight:FontWeight.bold)),
+    subtitle:Text(f.short),
+    trailing:Icon(open==f.key?Icons.expand_less:Icons.expand_more),
+  ),
+  if(open==f.key)Padding(padding:const EdgeInsets.fromLTRB(16,0,16,16),child:Align(alignment:Alignment.centerLeft,child:Text(f.long,style:const TextStyle(color:Colors.white70)))),
+]));
+Widget _section(String label,String sub,List<NativeFeature> items)=>Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+  Padding(padding:const EdgeInsets.only(top:18,bottom:2),child:Text(label,style:const TextStyle(fontSize:13,fontWeight:FontWeight.bold,color:Colors.white54,letterSpacing:1))),
+  Padding(padding:const EdgeInsets.only(bottom:10),child:Text(sub,style:const TextStyle(color:Colors.white38,fontSize:12))),
+  for(final f in items.where(_matches)) _row(f),
+]);
+@override Widget build(BuildContext c){
+  final free=nativeFeatureCatalog.where((f)=>f.tier=='FREE').toList();
+  final pro=nativeFeatureCatalog.where((f)=>f.tier=='PRO').toList();
+  return shell('REFERENCE','Native Features','Every capability WyBuild can add to a Web → Android wrapper, and how it actually works under the hood.',Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search native features'),onChanged:(v)=>setState(()=>q=v)),
+    _section('FREE — always included','Added to every Web → Android build automatically, on every plan.',free),
+    _section('PRO — selectable','Only selectable once the server verifies a Pro or Pro+ entitlement. Pick these on the Projects build page.',pro),
+  ]));
+}}
 
 class Features extends StatefulWidget{const Features({super.key});@override State<Features>createState()=>_FeaturesState();}
 class _FeaturesState extends State<Features>{String q='';int? open;final fs=[['🧠','Automatic project detection','Detect Flutter, Android/Gradle, Vite/React, Node and vanilla HTML.'],['⚙️','One-tap workflow installation','WyBuild creates or updates the GitHub Actions workflow for the repository.'],['🩺','Project Doctor','Check repository markers before building and get a recommended path.'],['📦','APK / AAB generation','Build an installable APK or Play Store AAB and download the real artifact after success.'],['🌐','Web → Android wrapper','Static web output is packaged into a generated Android WebView app without Android Studio.'],['🆓','Free native bundle','Internet, JavaScript, storage, file picker, sharing, vibration, orientation, battery, network/device info and local notifications are automatically available.'],['⭐','Pro native toolkit','Camera/mic, GPS, downloads, external links, fullscreen, biometrics, encrypted Keystore storage, screenshot protection, picture-in-picture and deep links are selectable for verified Pro users.'],['🔌','Native JavaScript bridge','Generated apps expose a WyBuild bridge for vibration, sharing, battery, network, device info, notifications, orientation, biometric auth, secure storage and PiP.'],['🔍','Real diagnostics','See original workflow status, artifacts and failure details instead of fake progress.'],['🚀','GitHub Releases','Create releases and attach artifacts through GitHub.'],['🔐','Secrets stay server-side','OAuth tokens and billing service secrets are not exposed to the browser.'],['💳','Server-verified billing','Premium access is granted only from the server-side WyDev entitlement; the browser cannot unlock Pro by itself.']];@override Widget build(BuildContext c){final f=fs.where((x)=>x.join(' ').toLowerCase().contains(q.toLowerCase())).toList();return shell('WYBUILD / FEATURES','What WyBuild adds to your build','Automation around the annoying parts of Android CI/CD.',Column(children:[TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search features'),onChanged:(v)=>setState(()=>q=v)),const SizedBox(height:12),for(int i=0;i<f.length;i++)card(Column(children:[ListTile(onTap:()=>setState(()=>open=open==i?null:i),leading:Text(f[i][0],style:const TextStyle(fontSize:23)),title:Text(f[i][1],style:const TextStyle(fontWeight:FontWeight.bold)),subtitle:Text(f[i][2]),trailing:Icon(open==i?Icons.remove:Icons.add)),if(open==i)const Padding(padding:EdgeInsets.all(12),child:Text('WyBuild performs this step inside the authenticated GitHub/CI flow rather than requiring the developer to manually configure every file.'))]))]));}}

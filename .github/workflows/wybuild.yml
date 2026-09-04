@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 19
+# wybuild-workflow-version: 20
 name: WyBuild
 on:
   workflow_dispatch:
@@ -246,7 +246,8 @@ jobs:
           has_feature SCREEN_CAPTURE && SCREEN_CAPTURE=true || true; has_feature PICTURE_IN_PICTURE && PICTURE_IN_PICTURE=true || true
           has_feature DEEP_LINKS && DEEP_LINKS=true || true
 
-          BIOMETRIC_DEP='implementation "androidx.biometric:biometric:1.1.0"'
+          BIOMETRIC_DEP=''
+          if [ "$BIOMETRIC" = true ]; then BIOMETRIC_DEP='implementation "androidx.biometric:biometric:1.1.0"'; fi
 
           cat > wybuild-wrapper/settings.gradle <<'EOF'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
@@ -266,7 +267,7 @@ jobs:
           android { namespace 'com.wybuild.wrapper'; compileSdk 35
             defaultConfig { applicationId 'com.wybuild.wrapper'; minSdk 23; targetSdk 35; versionCode 1; versionName '1.0' }
           }
-          dependencies { $BIOMETRIC_DEP }
+          dependencies { implementation "androidx.fragment:fragment:1.8.5"; $BIOMETRIC_DEP }
           EOF
           cat > wybuild-wrapper/app/src/main/res/values/styles.xml <<'EOF'
           <resources><style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:colorAccent">#4F46E5</item></style></resources>
@@ -288,8 +289,8 @@ jobs:
           EOF
           cat > wybuild-wrapper/app/src/main/java/com/wybuild/wrapper/MainActivity.java <<EOF
           package com.wybuild.wrapper;
-          import android.Manifest; import android.app.*; import android.content.*; import android.content.pm.ActivityInfo; import android.net.*; import android.os.*; import android.provider.Settings; import android.view.View; import android.view.WindowManager; import android.webkit.*; import android.widget.Toast; import androidx.biometric.BiometricPrompt; import androidx.core.content.ContextCompat; import java.util.Locale; import java.security.KeyStore; import javax.crypto.Cipher; import javax.crypto.KeyGenerator; import javax.crypto.SecretKey; import javax.crypto.spec.GCMParameterSpec; import android.util.Base64;
-          public class MainActivity extends androidx.fragment.app.FragmentActivity {
+          import android.Manifest; import android.app.*; import android.content.*; import android.content.pm.ActivityInfo; import androidx.fragment.app.FragmentActivity; import android.net.*; import android.os.*; import android.provider.Settings; import android.view.View; import android.view.WindowManager; import android.webkit.*; import android.widget.Toast; import androidx.biometric.BiometricPrompt; import androidx.core.content.ContextCompat; import java.util.Locale; import java.security.KeyStore; import javax.crypto.Cipher; import javax.crypto.KeyGenerator; import javax.crypto.SecretKey; import javax.crypto.spec.GCMParameterSpec; import android.util.Base64;
+          public class MainActivity extends FragmentActivity {
             private static final int FILE_CHOOSER=1001; private WebView web; private ValueCallback<Uri[]> fileCallback;
             private final boolean CAMERA=$CAMERA, LOCATION=$LOCATION, DOWNLOADS=$DOWNLOADS, EXTERNAL_LINKS=$EXTERNAL_LINKS, FULLSCREEN=$FULLSCREEN;
             private final boolean SHARE=$SHARE, VIBRATION=$VIBRATION, ORIENTATION=$ORIENTATION, BATTERY=$BATTERY, NETWORK_STATUS=$NETWORK_STATUS, DEVICE_INFO=$DEVICE_INFO, LOCAL_NOTIFICATIONS=$LOCAL_NOTIFICATIONS;
