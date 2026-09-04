@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#090B10">
 <meta name="description" content="WyBuild — automatic Android build setup and GitHub Actions shipping platform">
-<link rel="manifest" href="manifest.json">
+<link rel="manifest" href="manifest.json?v=20">
 <title>WyBuild</title>
+<script>
+// Prevent an older Flutter PWA service worker/cache from pinning the app to a previous deployment.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.getRegistrations().then(function (regs) {
+      return Promise.all(regs.map(function (r) { return r.unregister(); }));
+    }).then(function () {
+      if ('caches' in window) return caches.keys().then(function (keys) { return Promise.all(keys.map(function (k) { return caches.delete(k); })); });
+    }).catch(function () {});
+  });
+}
+</script>
 </head><body><script src="flutter_bootstrap.js" async></script></body></html>

@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 17
+# wybuild-workflow-version: 19
 name: WyBuild
 on:
   workflow_dispatch:
@@ -322,7 +322,7 @@ jobs:
           }
           EOF
           cd wybuild-wrapper
-          gradle wrapper --gradle-version 8.11.1
+          gradle wrapper --gradle-version 8.9
           chmod +x gradlew
           if [ "${{ inputs.build_type }}" = "aab" ]; then
             ./gradlew bundleRelease --no-daemon --stacktrace

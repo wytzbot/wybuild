@@ -61,7 +61,7 @@ Never commit secrets.
 
 ## GitHub workflow
 
-The workflow is version 17 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The backend installs it into a setup branch and attempts to create/merge a pull request into the default branch.
+The workflow is version 19 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The backend installs it into a setup branch and attempts to create/merge a pull request into the default branch.
 
 Supported direct Android builds:
 

@@ -6,4 +6,4 @@ if ! command -v flutter >/dev/null 2>&1; then
 fi
 flutter config --enable-web
 flutter pub get
-flutter build web --release
+flutter build web --release --pwa-strategy=none
