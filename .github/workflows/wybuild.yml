@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 15
+# wybuild-workflow-version: 16
 name: WyBuild
 on:
   workflow_dispatch:
@@ -246,8 +246,7 @@ jobs:
           has_feature SCREEN_CAPTURE && SCREEN_CAPTURE=true || true; has_feature PICTURE_IN_PICTURE && PICTURE_IN_PICTURE=true || true
           has_feature DEEP_LINKS && DEEP_LINKS=true || true
 
-          BIOMETRIC_DEP=''
-          if [ "$BIOMETRIC" = true ]; then BIOMETRIC_DEP='implementation "androidx.biometric:biometric:1.1.0"'; fi
+          BIOMETRIC_DEP='implementation "androidx.biometric:biometric:1.1.0"'
 
           cat > wybuild-wrapper/settings.gradle <<'EOF'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
@@ -289,7 +288,7 @@ jobs:
           EOF
           cat > wybuild-wrapper/app/src/main/java/com/wybuild/wrapper/MainActivity.java <<EOF
           package com.wybuild.wrapper;
-          import android.Manifest; import android.app.*; import android.content.*; import android.content.pm.ActivityInfo; import android.net.*; import android.os.*; import android.provider.Settings; import android.view.View; import android.webkit.*; import android.widget.Toast; import androidx.biometric.BiometricPrompt; import androidx.core.content.ContextCompat; import java.util.Locale; import java.security.KeyStore; import javax.crypto.Cipher; import javax.crypto.KeyGenerator; import javax.crypto.SecretKey; import javax.crypto.spec.GCMParameterSpec; import android.util.Base64;
+          import android.Manifest; import android.app.*; import android.content.*; import android.content.pm.ActivityInfo; import android.net.*; import android.os.*; import android.provider.Settings; import android.view.View; import android.view.WindowManager; import android.webkit.*; import android.widget.Toast; import androidx.biometric.BiometricPrompt; import androidx.core.content.ContextCompat; import java.util.Locale; import java.security.KeyStore; import javax.crypto.Cipher; import javax.crypto.KeyGenerator; import javax.crypto.SecretKey; import javax.crypto.spec.GCMParameterSpec; import android.util.Base64;
           public class MainActivity extends Activity {
             private static final int FILE_CHOOSER=1001; private WebView web; private ValueCallback<Uri[]> fileCallback;
             private final boolean CAMERA=$CAMERA, LOCATION=$LOCATION, DOWNLOADS=$DOWNLOADS, EXTERNAL_LINKS=$EXTERNAL_LINKS, FULLSCREEN=$FULLSCREEN;
