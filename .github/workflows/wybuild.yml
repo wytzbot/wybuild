@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 26
+# wybuild-workflow-version: 27
 name: WyBuild
 on:
   workflow_dispatch:
@@ -98,7 +98,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' && 'npm' || '' }}
       - name: Install Node dependencies
         if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
         shell: bash
