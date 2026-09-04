@@ -1,0 +1,2 @@
+plugins { id 'com.android.application' version '8.7.3' apply false }
+allprojects { configurations.configureEach { exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'; exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'; resolutionStrategy.eachDependency { d -> if (d.requested.group == 'org.jetbrains.kotlin') d.useVersion '2.4.10' } } }

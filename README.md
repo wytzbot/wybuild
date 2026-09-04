@@ -61,7 +61,7 @@ Never commit secrets.
 
 ## GitHub workflow
 
-The workflow is version 19 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The backend installs it into a setup branch and attempts to create/merge a pull request into the default branch.
+The workflow is version 24 and is embedded in `api/index.js` as well as `.github/workflows/wybuild.yml`. The native Android shell is maintained under `.wybuild/android-shell/` and copied into each web build without regenerating the Android project.
 
 Supported direct Android builds:
 

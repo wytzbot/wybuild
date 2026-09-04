@@ -1,0 +1,3 @@
+plugins { id 'com.android.application' }
+android { namespace 'com.wybuild.wrapper'; compileSdk 35; defaultConfig { applicationId 'com.wybuild.wrapper'; minSdk 23; targetSdk 35; versionCode 1; versionName '1.0' } }
+dependencies { implementation platform("org.jetbrains.kotlin:kotlin-bom:2.4.10"); implementation "org.jetbrains.kotlin:kotlin-stdlib:2.4.10"; implementation "androidx.fragment:fragment:1.8.5" }

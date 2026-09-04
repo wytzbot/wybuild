@@ -3,14 +3,78 @@
   "buildCommand": "bash vercel-build.sh",
   "outputDirectory": "build/web",
   "headers": [
-    {"source":"/", "headers":[{"key":"Cache-Control","value":"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"}]},
-    {"source":"/index.html", "headers":[{"key":"Cache-Control","value":"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"}]},
-    {"source":"/flutter_bootstrap.js", "headers":[{"key":"Cache-Control","value":"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"}]},
-    {"source":"/manifest.json", "headers":[{"key":"Cache-Control","value":"no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"}]},
-    {"source":"/(.*)", "headers":[{"key":"Vary","value":"Accept-Encoding"}]}
+    {
+      "source": "/",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/index.html",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/flutter_bootstrap.js",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/flutter.js",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/main.dart.js",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/manifest.json",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
+        }
+      ]
+    },
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Vary",
+          "value": "Accept-Encoding"
+        }
+      ]
+    }
   ],
   "rewrites": [
-    {"source": "/api/(.*)", "destination": "/api/index.js"},
-    {"source": "/(.*)", "destination": "/index.html"}
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
   ]
 }

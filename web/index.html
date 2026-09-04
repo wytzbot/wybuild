@@ -5,18 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#090B10">
 <meta name="description" content="WyBuild — automatic Android build setup and GitHub Actions shipping platform">
-<link rel="manifest" href="manifest.json?v=20">
+<link rel="manifest" href="manifest.json?v=21">
 <title>WyBuild</title>
 <script>
-// Prevent an older Flutter PWA service worker/cache from pinning the app to a previous deployment.
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', function () {
-    navigator.serviceWorker.getRegistrations().then(function (regs) {
-      return Promise.all(regs.map(function (r) { return r.unregister(); }));
-    }).then(function () {
-      if ('caches' in window) return caches.keys().then(function (keys) { return Promise.all(keys.map(function (k) { return caches.delete(k); })); });
-    }).catch(function () {});
-  });
-}
+// Kill legacy Flutter PWA workers/caches before the new Flutter bootstrap runs.
+// A one-time reload is used because an already-controlled document can remain
+// attached to an old service worker until navigation; sessionStorage prevents a
+// reload loop. The current build also uses --pwa-strategy=none.
+(function () {
+  if (!('serviceWorker' in navigator)) return;
+  var key = '__wybuild_sw_cleanup_v21__';
+  if (sessionStorage.getItem(key)) return;
+  sessionStorage.setItem(key, '1');
+  navigator.serviceWorker.getRegistrations().then(function (regs) {
+    return Promise.all(regs.map(function (r) { return r.unregister(); }));
+  }).then(function () {
+    if (!('caches' in window)) return;
+    return caches.keys().then(function (keys) {
+      return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+    });
+  }).then(function () {
+    location.reload();
+  }).catch(function () {});
+})();
 </script>
 </head><body><script src="flutter_bootstrap.js" async></script></body></html>
