@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 16
+# wybuild-workflow-version: 17
 name: WyBuild
 on:
   workflow_dispatch:
@@ -289,7 +289,7 @@ jobs:
           cat > wybuild-wrapper/app/src/main/java/com/wybuild/wrapper/MainActivity.java <<EOF
           package com.wybuild.wrapper;
           import android.Manifest; import android.app.*; import android.content.*; import android.content.pm.ActivityInfo; import android.net.*; import android.os.*; import android.provider.Settings; import android.view.View; import android.view.WindowManager; import android.webkit.*; import android.widget.Toast; import androidx.biometric.BiometricPrompt; import androidx.core.content.ContextCompat; import java.util.Locale; import java.security.KeyStore; import javax.crypto.Cipher; import javax.crypto.KeyGenerator; import javax.crypto.SecretKey; import javax.crypto.spec.GCMParameterSpec; import android.util.Base64;
-          public class MainActivity extends Activity {
+          public class MainActivity extends androidx.fragment.app.FragmentActivity {
             private static final int FILE_CHOOSER=1001; private WebView web; private ValueCallback<Uri[]> fileCallback;
             private final boolean CAMERA=$CAMERA, LOCATION=$LOCATION, DOWNLOADS=$DOWNLOADS, EXTERNAL_LINKS=$EXTERNAL_LINKS, FULLSCREEN=$FULLSCREEN;
             private final boolean SHARE=$SHARE, VIBRATION=$VIBRATION, ORIENTATION=$ORIENTATION, BATTERY=$BATTERY, NETWORK_STATUS=$NETWORK_STATUS, DEVICE_INFO=$DEVICE_INFO, LOCAL_NOTIFICATIONS=$LOCAL_NOTIFICATIONS;

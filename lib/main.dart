@@ -214,7 +214,31 @@ class _ProjectsState extends State<Projects>{
  Future<void> diagnose() async {if(repo==null||branch.isEmpty)return;setState(()=>checking=true);try{final d=await api.call('/api/github/diagnose',q:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});if(mounted)setState(()=>diagnosis=Map<String,dynamic>.from(d));}catch(e){/* older backend */}finally{if(mounted)setState(()=>checking=false);}}
  Future<void> check() async {if(repo==null)return;setState(()=>checking=true);try{final d=await api.call('/api/github/workflow',q:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});setState(()=>workflow=d);}catch(e){setState(()=>error=e.toString());}finally{setState(()=>checking=false);}}
  Future<void> install() async {if(repo==null)return;setState(()=>setup=true);try{final d=await api.call('/api/github/install-workflow',method:'POST',body:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});setState(()=>message=d['message']??'Workflow setup complete.');await check();}catch(e){setState(()=>error=e.toString());}finally{setState(()=>setup=false);}}
- Future<void> doBuild() async {if(repo==null)return;final t=targets[target]!;setState(()=>loading=true);try{await api.call('/api/github/dispatch',method:'POST',body:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch,'inputs':{'build_type':t.$2,'build_mode':t.$3,'native_features':_nativeFeatureString()}});setState(()=>message='Build queued in GitHub Actions. Open Builds to monitor it.');}catch(e){setState(()=>error=e.toString());}finally{setState(()=>loading=false);}}
+ Future<void> doBuild() async {
+    if(repo==null||branch.isEmpty)return;
+    final t=targets[target]!;
+    setState(()=>loading=true);
+    try{
+      final status=await api.call('/api/github/workflow',q:{
+        'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch
+      });
+      if(status['dispatchable']!=true||status['upToDate']!=true){
+        final installed=await api.call('/api/github/install-workflow',method:'POST',body:{
+          'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch
+        });
+        if(installed['merged']!=true){
+          throw Exception(installed['message']??'Workflow setup needs to be completed before building.');
+        }
+        await Future<void>.delayed(const Duration(seconds:2));
+      }
+      await api.call('/api/github/dispatch',method:'POST',body:{
+        'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch,
+        'inputs':{'build_type':t.$2,'build_mode':t.$3,'native_features':_nativeFeatureString()}
+      });
+      setState(()=>message='Build queued in GitHub Actions. Open Builds to monitor it.');
+    }catch(e){setState(()=>error=e.toString());}
+    finally{setState(()=>loading=false);}
+  }
  @override Widget build(BuildContext c){
   if(widget.session==null)return shell('WORKSPACE','Projects','Connect GitHub to let WyBuild inspect repositories and install workflows.',card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Text('GitHub connection required',style:TextStyle(fontSize:19,fontWeight:FontWeight.bold)),const SizedBox(height:8),const Text('WyBuild uses GitHub authorization instead of asking you to paste a personal access token.'),const SizedBox(height:14),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));
   return shell('WORKSPACE','Projects','Pick a repository. WyBuild will diagnose the project, set up the workflow and run the build.',Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
