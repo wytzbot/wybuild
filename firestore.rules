@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // WyBuild accesses billing, usage, FCM registration state and caches only
+    // through the server-side Firebase Admin SDK. Deny direct client access.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

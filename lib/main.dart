@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:js_interop';
 import 'package:web/web.dart' as web;
 import 'dart:async';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:http/browser_client.dart';
 import 'package:http/http.dart' as http;
@@ -26,14 +28,35 @@ class Api {
       } else {
         r = await client.get(uri, headers: {'Accept':'application/json'});
       }
-    } catch (e) {
-      throw Exception('Network error. Check your connection and retry.');
+    } on Exception catch (e) {
+      throw Exception('Could not reach WyBuild API for $path. Check your internet connection, then retry. Technical detail: $e');
     }
     dynamic data;
-    try { data = r.body.isEmpty ? {} : jsonDecode(r.body); } catch (_) { data = {}; }
+    try {
+      data = r.body.isEmpty ? <String, dynamic>{} : jsonDecode(r.body);
+    } on FormatException catch (e) {
+      if (r.statusCode >= 200 && r.statusCode < 300) {
+        throw Exception('WyBuild API $path returned HTTP ${r.statusCode}, but its response was not valid JSON. Check the Vercel function logs and deployment version. Parser detail: ${e.message}');
+      }
+      data = <String, dynamic>{};
+    }
     if (r.statusCode < 200 || r.statusCode >= 300) {
       if (r.statusCode == 401 && path == '/api/auth/me') return {'authenticated':false};
-      throw Exception(data is Map && data['error'] != null ? data['error'] : 'Request failed (${r.statusCode})');
+      final payload = data is Map ? data : <String, dynamic>{};
+      final serverMessage = payload['error']?.toString();
+      final code = payload['code']?.toString();
+      final details = payload['details']?.toString();
+      final nextStep = payload['nextStep']?.toString();
+      final requestId = payload['requestId']?.toString();
+      final parts = <String>[];
+      if (serverMessage != null && serverMessage.isNotEmpty) parts.add(serverMessage);
+      else parts.add('WyBuild API request failed with HTTP ${r.statusCode} at $path.');
+      if (code != null && code.isNotEmpty) parts.add('Code: $code.');
+      if (details != null && details.isNotEmpty && details != serverMessage) parts.add('GitHub/API detail: $details');
+      if (nextStep != null && nextStep.isNotEmpty) parts.add('Next step: $nextStep');
+      if (requestId != null && requestId.isNotEmpty) parts.add('Reference: $requestId.');
+      parts.add('HTTP ${r.statusCode}.');
+      throw Exception(parts.join('\n'));
     }
     return data;
   }
@@ -47,11 +70,33 @@ class WyBuildApp extends StatefulWidget {
   const WyBuildApp({super.key});
   @override State<WyBuildApp> createState() => _WyBuildAppState();
 }
-class _WyBuildAppState extends State<WyBuildApp> {
+class _WyBuildAppState extends State<WyBuildApp> with WidgetsBindingObserver {
   String page = 'home';
+  late final JSFunction _popStateHandler;
+  static const Set<String> _knownRoutes = {'home','dashboard','projects','builds','releases','docs','features','native-features','devtools','billing','settings','help','privacy','terms'};
+
+  String? _routeFromHash() {
+    final raw = web.window.location.hash.replaceFirst('#', '').trim();
+    final route = raw.isEmpty ? 'home' : raw;
+    return _knownRoutes.contains(route) ? route : null;
+  }
+
+  Future<void> _refreshApp() async {
+    // Reload the current route; the hash keeps the user on the same page.
+    web.window.location.reload();
+  }
+
+  void _goBack() {
+    if (page != 'home') {
+      web.window.history.back();
+    } else {
+      snack('You are already on the home page.');
+    }
+  }
   bool drawer = false;
   Map<String,dynamic>? session;
   bool loadingSession = true;
+  String sessionLoadError = '';
 
   final pages = const [
     ('dashboard','Dashboard',Icons.dashboard_outlined),
@@ -60,22 +105,45 @@ class _WyBuildAppState extends State<WyBuildApp> {
     ('releases','Releases',Icons.rocket_launch_outlined),
     ('docs','Docs & Guide',Icons.menu_book_outlined),
     ('features','Build Features',Icons.auto_awesome_outlined),
-    
-    ('billing','Free Beta',Icons.rocket_launch_outlined),
+    ('devtools','Free Dev Tools',Icons.build_outlined),
+    ('billing','Plans',Icons.workspace_premium_outlined),
     ('settings','Settings',Icons.settings_outlined),
     ('help','Help',Icons.help_outline),
     ('privacy','Privacy',Icons.lock_outline),
     ('terms','Terms',Icons.description_outlined),
   ];
 
-  @override void initState() { super.initState(); loadSession(); }
+  @override void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    final initialRoute = _routeFromHash();
+    if (initialRoute != null) page = initialRoute;
+    _popStateHandler = ((web.Event event) {
+      final route = _routeFromHash();
+      if (mounted && route != null) setState(() { page = route; drawer = false; });
+    }).toJS;
+    web.window.addEventListener('popstate', _popStateHandler);
+    web.window.history.replaceState(null, '', '#$page');
+    loadSession();
+  }
+
+  @override void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    web.window.removeEventListener('popstate', _popStateHandler);
+    super.dispose();
+  }
   Future<void> loadSession() async {
     try {
       final d = await api.call('/api/auth/me');
       if (mounted) setState(() { session = d['authenticated'] == true ? Map<String,dynamic>.from(d) : null; loadingSession=false; });
-    } catch (_) { if (mounted) setState(()=>loadingSession=false); }
+    } catch (e) { if (mounted) setState(() { loadingSession=false; sessionLoadError='Could not verify your GitHub session. $e'; }); }
   }
-  void go(String p) => setState(() { page=p; drawer=false; });
+  void go(String p) {
+    if (!_knownRoutes.contains(p)) return;
+    if (p == page) { setState(() => drawer = false); return; }
+    web.window.history.pushState(null, '', '#$p');
+    setState(() { page=p; drawer=false; });
+  }
 
   @override Widget build(BuildContext context) {
     return MaterialApp(
@@ -96,13 +164,22 @@ class _WyBuildAppState extends State<WyBuildApp> {
           leading: IconButton(icon: const Icon(Icons.menu), onPressed:()=>setState(()=>drawer=!drawer)),
           title: const Text('WYBUILD', style: TextStyle(fontWeight:FontWeight.w800, letterSpacing:1.5)),
           actions:[
+            if (page != 'home') IconButton(tooltip:'Back', onPressed:_goBack, icon:const Icon(Icons.arrow_back)),
+            IconButton(tooltip:'Refresh page', onPressed:_refreshApp, icon:const Icon(Icons.refresh)),
             if (loadingSession) const Padding(padding:EdgeInsets.all(16), child:SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)))
             else TextButton.icon(onPressed:session==null?api.login:()=>logout(), icon:Icon(session==null?Icons.login:Icons.account_circle_outlined), label:Text(session==null?'Connect GitHub':'@${session!['user']['login']}'))
           ],
         ),
-        body: Row(children:[
-          if (drawer || MediaQuery.of(context).size.width >= 900) SizedBox(width:260, child: _sideNav()),
-          Expanded(child: _content()),
+        body: Column(children:[
+          if (sessionLoadError.isNotEmpty) MaterialBanner(
+            content: Text(sessionLoadError),
+            leading: const Icon(Icons.warning_amber_rounded),
+            actions: [TextButton(onPressed: loadSession, child: const Text('Retry')), TextButton(onPressed: () => setState(() => sessionLoadError=''), child: const Text('Dismiss'))],
+          ),
+          Expanded(child: Row(children:[
+            if (drawer || MediaQuery.of(context).size.width >= 900) SizedBox(width:260, child: _sideNav()),
+            Expanded(child: RefreshIndicator(onRefresh:_refreshApp, child:_content())),
+          ])),
         ]),
       ),
     );
@@ -139,6 +216,7 @@ class _WyBuildAppState extends State<WyBuildApp> {
       case 'docs': return Docs();
       case 'features': return Features();
       case 'native-features': return NativeFeatures();
+      case 'devtools': return DevTools();
       case 'billing': return Billing(session:session, onLogin:api.login, snack:snack);
       case 'settings': return Settings(session:session, onLogin:api.login, snack:snack);
       case 'help': return Help(go:go);
@@ -150,6 +228,7 @@ class _WyBuildAppState extends State<WyBuildApp> {
 }
 
 Widget shell(String eyebrow,String title,String sub,Widget child) => SingleChildScrollView(
+  physics:const AlwaysScrollableScrollPhysics(),
   padding:const EdgeInsets.all(24),
   child:Center(child:ConstrainedBox(constraints:const BoxConstraints(maxWidth:1100),child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
     Text(eyebrow,style:const TextStyle(color:Color(0xFF8B93A7),fontSize:11,fontWeight:FontWeight.bold,letterSpacing:1.5)),
@@ -161,7 +240,7 @@ Widget card(Widget child) => Card(child:Padding(padding:const EdgeInsets.all(18)
 Widget btn(String text, VoidCallback? on, {bool secondary=false, IconData? icon}) =>
   ElevatedButton.icon(onPressed:on, icon:Icon(icon??(secondary?Icons.arrow_forward:Icons.play_arrow)), label:Text(text));
 Widget statusChip(String s) {
-  final good=s=='success'||s=='completed'; final bad=s=='failure'||s=='cancelled';
+  final good=s=='success'||s=='completed'; final bad=s=='failure'||s=='cancelled'||s=='timed_out'||s=='startup_failure'||s=='action_required';
   return Chip(label:Text(s),avatar:Icon(good?Icons.check:bad?Icons.close:Icons.hourglass_empty,size:15),backgroundColor:good?Colors.green.withOpacity(.15):bad?Colors.red.withOpacity(.15):Colors.amber.withOpacity(.12));
 }
 
@@ -194,9 +273,10 @@ class _DashboardState extends State<Dashboard>{
   // repos this turns N sequential round trips into a single wait for the
   // slowest one. A repo that errors (e.g. Actions disabled) just contributes
   // zero runs instead of failing the whole dashboard.
-  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).catchError((_)=>{'workflow_runs':[]})));
+  final failures=<String>[];
+  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).catchError((e){failures.add('${r['full_name']}: $e');return {'workflow_runs':[]};})));
   int rr=0,ss=0;for(final x in results){for(final w in (x['workflow_runs']??[])){if(w['name']=='WyBuild'){rr++;if(w['conclusion']=='success')ss++;}}}
-  if(mounted)setState(() { repos=rs.length; runs=rr; success=ss; loading=false; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
+  if(mounted)setState(() { repos=rs.length; runs=rr; success=ss; loading=false; error=failures.isEmpty?'':'Some repository build histories could not be loaded:\n${failures.join('\n')}'; });}catch(e){if(mounted)setState(() { error='Dashboard could not load repositories or build history. $e'; loading=false; });}}
  @override Widget build(BuildContext c)=>shell('OVERVIEW','Dashboard','Your GitHub-connected build workspace.',loading?const Center(child:CircularProgressIndicator()):Column(children:[
   if(error.isNotEmpty) card(Text(error)),
   Row(children:[Expanded(child:card(_stat('Repositories','$repos'))),const SizedBox(width:12),Expanded(child:card(_stat('WyBuild runs','$runs'))),const SizedBox(width:12),Expanded(child:card(_stat('Successful','$success')))]),
@@ -211,18 +291,52 @@ class Projects extends StatefulWidget {
  @override State<Projects> createState()=>_ProjectsState();
 }
 class _ProjectsState extends State<Projects>{
- List repos=[]; List branches=[]; Map<String,dynamic>? repo; String branch=''; String target='auto'; String twaUrl=''; String twaPackageId='com.example.myapp'; String twaAppName='My App'; bool loading=false,setup=false,checking=false,featuresOpen=false; Map<String,dynamic>? workflow,diagnosis,playReadiness; String error='',message=''; String plan='FREE'; bool planLoading=false; final Set<String> selectedProFeatures=<String>{}; final freeFeatures=<String>['INTERNET','JAVASCRIPT','DOM_STORAGE','BACK_BUTTON','FILE_PICKER','SHARE','VIBRATION','ORIENTATION','BATTERY','NETWORK_STATUS','DEVICE_INFO','LOCAL_NOTIFICATIONS']; final proFeatures=<String>['CAMERA_MIC','LOCATION','DOWNLOADS','EXTERNAL_LINKS','FULLSCREEN','BIOMETRIC','SECURE_STORAGE','SCREEN_CAPTURE','PICTURE_IN_PICTURE','DEEP_LINKS']; String _nativeFeatureString()=>[...freeFeatures,...((plan=='PRO'||plan=='PRO+'||plan=='PROPLUS')?selectedProFeatures:<String>{})].join(',');
- final targets={'auto':('Auto Detect','auto','release'),'debug':('Android APK • Debug','apk','debug'),'apk':('Android APK • Release','apk','release'),'aab':('Android AAB • Play Store','aab','release'),'web':('Web App artifact','web','release'),'twaapk':('Web → Android TWA APK','twa','release'),'twaaab':('Web → Android TWA AAB','twa','release')};
- @override void initState(){super.initState();if(widget.session!=null){loadRepos();loadPlan();}}
-  Future<void> loadPlan() async {setState(()=>planLoading=true);try{final x=await api.call('/api/billing/status');if(mounted)setState(()=>plan=(x['plan']?.toString() ?? 'FREE').toUpperCase());}catch(_){ }finally{if(mounted)setState(()=>planLoading=false);}}
+ List repos=[]; List branches=[]; Map<String,dynamic>? repo; String branch=''; String target='auto'; String twaUrl=''; String twaPackageId='com.example.myapp'; String twaAppName='My App'; bool loading=false,setup=false,checking=false; Map<String,dynamic>? workflow,diagnosis,playReadiness; String error='',message=''; final Map<String,Set<String>> nativeFeaturesByRepo=<String,Set<String>>{};
+ Set<String> get selectedNativeFeatures { if(repo==null) return <String>{}; return nativeFeaturesByRepo.putIfAbsent('${repo!['full_name']}',()=> <String>{}); }
+ String _nativeFeatureString()=>selectedNativeFeatures.join(',');
+ bool get _isTwaTarget=>target=='twaapk'||target=='twaaab';
+ final targets={'auto':('APK + AAB • Auto Detect','auto','release'),'debug':('Android APK • Debug','apk','debug'),'apk':('Android APK • Release','apk','release'),'aab':('Android AAB • Play Store','aab','release'),'web':('Web App artifact','web','release'),'twaapk':('Web → Android TWA APK','twa','release'),'twaaab':('Web → Android TWA AAB','twa','release')};
+ @override void initState(){super.initState();if(widget.session!=null){loadRepos();}}
  Future<void> loadRepos() async {try{final x=await api.call('/api/github/repos');if(mounted)setState(()=>repos=x);}catch(e){setState(()=>error=e.toString());}}
  Future<void> selectRepo(dynamic r) async {setState(() { repo=Map<String,dynamic>.from(r); branches=[]; branch=''; workflow=null; diagnosis=null; playReadiness=null; });try{final b=await api.call('/api/github/branches',q:{'owner':r['owner']['login'],'repo':r['name']});if(mounted)setState(() { branches=b; branch=r['default_branch']; });await diagnose();}catch(e){setState(()=>error=e.toString());}}
- Future<void> diagnose() async {if(repo==null||branch.isEmpty)return;setState(()=>checking=true);try{final d=await api.call('/api/github/diagnose',q:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});if(mounted)setState(()=>diagnosis=Map<String,dynamic>.from(d));}catch(e){/* older backend */}finally{if(mounted)setState(()=>checking=false);}}
+ Future<void> diagnose() async {if(repo==null||branch.isEmpty)return;setState(()=>checking=true);try{final d=await api.call('/api/github/diagnose',q:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});if(mounted)setState(()=>diagnosis=Map<String,dynamic>.from(d));}catch(e){if(mounted)setState(()=>error='Project Doctor could not inspect ${repo!['full_name'] ?? repo!['name']} on branch $branch. $e');}finally{if(mounted)setState(()=>checking=false);}}
  Future<void> check() async {if(repo==null)return;setState(()=>checking=true);try{final d=await api.call('/api/github/workflow',q:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});setState(()=>workflow=d);}catch(e){setState(()=>error=e.toString());}finally{setState(()=>checking=false);}}
  Future<void> checkPlayReadiness() async {if(repo==null||branch.isEmpty)return;setState(()=>checking=true);try{final d=await api.call('/api/github/play-readiness',q:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch,'target':target});if(mounted)setState(()=>playReadiness=Map<String,dynamic>.from(d));}catch(e){if(mounted)setState(()=>error='Play Store readiness check failed: $e');}finally{if(mounted)setState(()=>checking=false);}}
  Future<void> install() async {if(repo==null)return;setState(()=>setup=true);try{final d=await api.call('/api/github/install-workflow',method:'POST',body:{'owner':repo!['owner']['login'],'repo':repo!['name'],'ref':branch});setState(()=>message='${d['message']??'Workflow setup complete.'} ${d['notificationsConfigured']==true?'Build push callback is configured.':'Push callback setup could not be confirmed; check GitHub Actions secret permissions and Firebase setup.'}');await check();}catch(e){setState(()=>error=e.toString());}finally{setState(()=>setup=false);}}
+ Widget _nativeFeatureSelector() {
+   final selectedCount=selectedNativeFeatures.length;
+   return Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+     PopupMenuButton<String>(
+       enabled:_isTwaTarget,
+       tooltip:'Select features for this project build',
+       onSelected:(key)=>setState(() { if(selectedNativeFeatures.contains(key)){selectedNativeFeatures.remove(key);}else{selectedNativeFeatures.add(key);} }),
+       itemBuilder:(context)=>nativeFeatureCatalog.where((f)=>f.key!='INTERNET').map((f)=>PopupMenuItem<String>(
+         value:f.key,height:68,
+         child:Row(children:[
+           Icon(selectedNativeFeatures.contains(f.key)?Icons.check_box:Icons.check_box_outline_blank,size:20,color:selectedNativeFeatures.contains(f.key)?Colors.deepPurpleAccent:Colors.white54),
+           const SizedBox(width:10),
+           Expanded(child:Column(mainAxisAlignment:MainAxisAlignment.center,crossAxisAlignment:CrossAxisAlignment.start,children:[
+             Text('${f.title}${f.tier=='PRO'?' • PRO':''}',style:TextStyle(fontWeight:FontWeight.w600,color:f.tier=='PRO'?Colors.amber:Colors.white)),
+             Text(f.short,maxLines:2,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:11,color:Colors.white60)),
+           ])),
+         ]),
+       )).toList(),
+       child:Container(width:double.infinity,padding:const EdgeInsets.symmetric(horizontal:14,vertical:14),decoration:BoxDecoration(color:const Color(0xFF11151D),border:Border.all(color:const Color(0xFF3A4050)),borderRadius:BorderRadius.circular(8)),child:Row(children:[
+         const Icon(Icons.extension_outlined),const SizedBox(width:10),Expanded(child:Text('Native features & gestures ($selectedCount selected)',style:const TextStyle(fontWeight:FontWeight.w600))),const Icon(Icons.arrow_drop_down),
+       ])),
+     ),
+     const SizedBox(height:6),
+     Text(_isTwaTarget
+       ?'Selections are applied where the TWA wrapper supports them. Camera, location, notifications and deep-link settings configure Android metadata; browser features still require the website/PWA to implement the corresponding web API. A TWA cannot inject a native JavaScript bridge into Chrome.'
+       :'Choose a Web → Android TWA APK/AAB target to configure these options. Existing Flutter/Gradle apps are built from their own source and are not rewritten by these switches.',
+       style:const TextStyle(color:Colors.white54,fontSize:12)),
+     if(selectedNativeFeatures.isNotEmpty) Padding(padding:const EdgeInsets.only(top:6),child:Text('Selected: ${selectedNativeFeatures.map(featureTitle).join(', ')}',style:const TextStyle(color:Colors.white70,fontSize:12))),
+   ]);
+ }
+
  Future<void> doBuild() async {
     if(repo==null||branch.isEmpty)return;
+    if(selectedNativeFeatures.isNotEmpty && !_isTwaTarget){setState(()=>error='Native feature selections apply only to generated TWA builds. Choose a TWA APK/AAB target or clear the selections before building another target.');return;}
     final t=targets[target]!;
     if(target=='twaapk'||target=='twaaab'){final uri=Uri.tryParse(twaUrl.trim()); if(uri==null||uri.scheme!='https'||uri.host.isEmpty){setState(()=>error='TWA requires your deployed HTTPS website URL.');return;} if(!RegExp(r'^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$').hasMatch(twaPackageId.trim())){setState(()=>error='Enter a valid Android package ID, e.g. com.example.myapp.');return;} if(twaAppName.trim().isEmpty){setState(()=>error='Enter an app name.');return;}}
     setState(()=>loading=true);
@@ -249,7 +363,7 @@ class _ProjectsState extends State<Projects>{
   }
  @override Widget build(BuildContext c){
   if(widget.session==null)return shell('WORKSPACE','Projects','Connect GitHub to let WyBuild inspect repositories and install workflows.',card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Text('GitHub connection required',style:TextStyle(fontSize:19,fontWeight:FontWeight.bold)),const SizedBox(height:8),const Text('WyBuild uses GitHub authorization instead of asking you to paste a personal access token.'),const SizedBox(height:14),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));
-  return shell('WORKSPACE','Projects','Pick a repository. WyBuild will diagnose the project, set up the workflow and run the build.',Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+  return shell('WORKSPACE','Projects','Pick a repository. WyBuild diagnoses it, installs/updates the workflow, then builds APK + AAB automatically for Flutter/Gradle projects.',Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
    if(error.isNotEmpty) _notice(error,true),
    if(message.isNotEmpty) _notice(message,false),
    card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
@@ -274,10 +388,14 @@ class _ProjectsState extends State<Projects>{
     card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
       const Text('3. Build target',style:TextStyle(fontSize:18,fontWeight:FontWeight.bold)),const SizedBox(height:12),
       DropdownButtonFormField<String>(value:target,decoration:const InputDecoration(labelText:'What do you want?'),items:targets.entries.map((e)=>DropdownMenuItem(value:e.key,child:Text(e.value.$1))).toList(),onChanged:(v)=>setState(() {target=v??'auto';playReadiness=null;})),
+      const SizedBox(height:12),
+      const Text('4. Native features & gestures',style:TextStyle(fontSize:17,fontWeight:FontWeight.bold)),
+      const SizedBox(height:8),
+      _nativeFeatureSelector(),
       if(target=='twaapk'||target=='twaaab') ...[
         const Text('Trusted Web Activity setup',style:TextStyle(fontSize:18,fontWeight:FontWeight.bold)),
         const SizedBox(height:8),
-        const Text('TWA loads your deployed HTTPS PWA in Chrome without embedding a WebView. Your site must have a valid web manifest and a Digital Asset Links file matching your Android package ID and persistent signing certificate. WyBuild checks the HTTPS URL, web manifest, signing key and Digital Asset Links before building.',style:TextStyle(color:Colors.white70)),
+        const Text('TWA loads your deployed HTTPS PWA in Chrome without embedding a WebView. Your site must have a valid web manifest and Digital Asset Links. For a test APK, the site association must match the APK signing certificate; for a Play AAB, it must match the Google Play app-signing certificate. WyBuild checks the HTTPS URL, web manifest, signing key and Digital Asset Links before building.',style:TextStyle(color:Colors.white70)),
         const SizedBox(height:12),
         TextField(decoration:const InputDecoration(labelText:'Deployed HTTPS website URL',hintText:'https://app.example.com'),keyboardType:TextInputType.url,onChanged:(v)=>twaUrl=v),
         const SizedBox(height:10),
@@ -289,7 +407,7 @@ class _ProjectsState extends State<Projects>{
       if(target=='web') const Text('Web output is not an Android app. For a no-WebView Android app, deploy your PWA over HTTPS and select a TWA target.',style:TextStyle(color:Colors.white70)),
       const SizedBox(height:12),
       card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-        const Row(children:[Icon(Icons.verified_user_outlined),SizedBox(width:8),Expanded(child:Text('4. Play Store Readiness Check',style:TextStyle(fontSize:17,fontWeight:FontWeight.bold)))]),
+        const Row(children:[Icon(Icons.verified_user_outlined),SizedBox(width:8),Expanded(child:Text('5. Play Store Readiness Check',style:TextStyle(fontSize:17,fontWeight:FontWeight.bold)))]),
         const SizedBox(height:6),
         const Text('Static checks for target SDK, signing, versioning, manifests, dependency locks and Play Console tasks. This is a preflight—not a Google approval guarantee.',style:TextStyle(color:Colors.white70)),
         const SizedBox(height:10),
@@ -309,7 +427,7 @@ class _ProjectsState extends State<Projects>{
    ]
   ]));
  }
- Widget _notice(String s,bool bad)=>Container(width:double.infinity,margin:const EdgeInsets.only(bottom:12),padding:const EdgeInsets.all(14),decoration:BoxDecoration(color:(bad?Colors.red:Colors.green).withOpacity(.12),borderRadius:BorderRadius.circular(10)),child:Text(s.replaceFirst('Exception: ','')));
+ Widget _notice(String s,bool bad)=>Container(width:double.infinity,margin:const EdgeInsets.only(bottom:12),padding:const EdgeInsets.all(14),decoration:BoxDecoration(color:(bad?Colors.red:Colors.green).withOpacity(.12),borderRadius:BorderRadius.circular(10)),child:Text(s.replaceFirst(RegExp(r'^(Exception|FormatException): '),''), softWrap:true));
  Widget _diagnosis(Map d)=>Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
   Text('Detected: ${d['type']??'unknown'}',style:const TextStyle(fontWeight:FontWeight.bold)),
   const SizedBox(height:8),
@@ -325,9 +443,9 @@ Future<void> load()async{if(widget.session==null){setState(()=>loading=false);re
   // The API endpoint is already scoped to wybuild.yml, so do not discard
   // runs based on the workflow display name.
   final failures=<String>[];
-  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).then((x)=>{'repo':r,'data':x}).catchError((_) { failures.add(r['full_name'] as String); return {'repo':r,'data':{'workflow_runs':[]}}; })));
+  final results=await Future.wait(rs.map((r)=>api.call('/api/github/runs',q:{'owner':r['owner']['login'],'repo':r['name']}).then((x)=>{'repo':r,'data':x}).catchError((_) { failures.add('${r['full_name']}: $_'); return {'repo':r,'data':{'workflow_runs':[]}}; })));
   final out=[];for(final res in results){final r=res['repo'];final x=res['data'];for(final w in (x['workflow_runs']??[])){out.add({...w,'repo':r['full_name'],'repoName':r['name'],'owner':r['owner']['login']});}}
-  out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; error=failures.isEmpty?'':'Could not load runs for: ${failures.join(', ')}'; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
+  out.sort((a,b)=>DateTime.parse(b['created_at']).compareTo(DateTime.parse(a['created_at'])));if(mounted)setState(() { runs=out.take(100).toList(); loading=false; error=failures.isEmpty?'':'Build history could not be loaded for these repositories:\n${failures.join('\n')}'; });}catch(e){if(mounted)setState(() { error=e.toString(); loading=false; });}}
 @override Widget build(BuildContext c){if(widget.session==null)return shell('HISTORY','Builds','Real GitHub Actions history.',card(Column(children:[const Text('Connect GitHub first'),const SizedBox(height:8),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));return shell('HISTORY','Builds','Showing WyBuild runs across your accessible repositories.',Column(children:[
   // Poll lightly while Builds is open so queued/in-progress runs appear
   // automatically. The explicit refresh button remains available.
@@ -338,14 +456,15 @@ Widget _notice(String s)=>Padding(padding:const EdgeInsets.only(bottom:12),child
 }
 
 class RunCard extends StatefulWidget{final dynamic run;final Future<void> Function() onRefresh;final void Function(String) snack;const RunCard({super.key,required this.run,required this.onRefresh,required this.snack});@override State<RunCard> createState()=>_RunCardState();}
-class _RunCardState extends State<RunCard>{dynamic detail;bool busy=false;List artifactList=[];bool artifactsChecked=false;
+class _RunCardState extends State<RunCard>{dynamic detail;bool busy=false;List artifactList=[];bool artifactsChecked=false;String artifactError='';bool diagnosing=false;Map<String,dynamic>? failureDiagnosis;bool get hasFailure=>const ['failure','timed_out','startup_failure','action_required'].contains(detail?['conclusion']);
 @override void initState(){super.initState();detail=widget.run;_maybeLoadArtifacts();}
 void _maybeLoadArtifacts(){if(detail['conclusion']=='success')_loadArtifacts();}
 // Fetched once up front (instead of only on click) so the correct
 // APK/AAB/Web button can be shown immediately and tapping it downloads
 // straight away with no extra round trip.
-Future<void> _loadArtifacts()async{try{final d=await api.call('/api/github/artifacts',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});if(mounted)setState((){artifactList=(d['artifacts']??[]) as List;artifactsChecked=true;});}catch(_){if(mounted)setState(()=>artifactsChecked=true);}}
+Future<void> _loadArtifacts()async{try{final d=await api.call('/api/github/artifacts',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});if(mounted)setState((){artifactList=(d['artifacts']??[]) as List;artifactsChecked=true;artifactError=artifactList.isEmpty?'Build succeeded, but GitHub returned no downloadable artifacts for this run. Check the Upload APK/AAB/Web output step in the workflow logs.':'';});}catch(e){if(mounted)setState((){artifactsChecked=true;artifactError='Could not load build artifacts. $e';});}}
 Future<void> refresh()async{setState(()=>busy=true);try{detail=await api.call('/api/github/run',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});artifactList=[];artifactsChecked=false;setState((){});_maybeLoadArtifacts();}catch(e){widget.snack(e.toString());}finally{setState(()=>busy=false);}}
+Future<void> diagnoseFailure()async{setState(()=>diagnosing=true);try{final d=await api.call('/api/github/diagnose-run',q:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});if(mounted)setState(()=>failureDiagnosis=Map<String,dynamic>.from(d));}catch(e){widget.snack('Could not diagnose this build. $e');}finally{if(mounted)setState(()=>diagnosing=false);}}
 Future<void> rerun()async{try{await api.call('/api/github/rerun',method:'POST',body:{'owner':widget.run['owner'],'repo':widget.run['repoName'],'id':'${widget.run['id']}'});await refresh();}catch(e){widget.snack(e.toString());}}
 Future<void> rebuildCurrent()async{
   try{
@@ -382,7 +501,59 @@ List<Widget> _downloadButtons(){
  if(web!=null)out.add(btn('Download Web Build',()=>_download(web),icon:Icons.public));
  return out;
 }
-@override Widget build(BuildContext c)=>Padding(padding:const EdgeInsets.only(bottom:12),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Row(children:[Expanded(child:Text('${detail['name']} • ${widget.run['repo']}',style:const TextStyle(fontWeight:FontWeight.bold))),statusChip('${detail['conclusion']??detail['status']}')]),const SizedBox(height:7),Text(DateTime.parse(detail['created_at']).toLocal().toString(),style:const TextStyle(color:Colors.white54)),const SizedBox(height:12),Wrap(spacing:8,runSpacing:8,children:[if(detail['conclusion']=='success'&&!artifactsChecked)const SizedBox(width:16,height:16,child:CircularProgressIndicator(strokeWidth:2)),..._downloadButtons(),btn('Rebuild',rebuildCurrent,secondary:true,icon:Icons.replay),btn(busy?'Refreshing…':'Refresh',busy?null:refresh,secondary:true,icon:Icons.refresh),if(detail['conclusion']=='failure')btn('Retry same run',rerun,secondary:true,icon:Icons.restart_alt),btn('Artifacts',artifacts,secondary:true,icon:Icons.download),btn('Logs',()=>web.window.location.assign('/api/github/logs?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${widget.run['id']}'),secondary:true,icon:Icons.list_alt),if(detail['html_url']!=null)btn('GitHub',()=>web.window.location.assign(detail['html_url']),secondary:true,icon:Icons.open_in_new)]),])));
+@override Widget build(BuildContext c) {
+  final diagnosis = failureDiagnosis;
+  final failedSteps = (diagnosis?['failedSteps'] as List?) ?? const [];
+  final excerpts = (diagnosis?['excerpts'] as List?) ?? const [];
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: card(Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(children: [
+          Expanded(child: Text('${detail['name']} • ${widget.run['repo']}', style: const TextStyle(fontWeight: FontWeight.bold))),
+          statusChip('${detail['conclusion'] ?? detail['status']}'),
+        ]),
+        const SizedBox(height: 7),
+        Text(DateTime.parse(detail['created_at']).toLocal().toString(), style: const TextStyle(color: Colors.white54)),
+        if (artifactError.isNotEmpty)
+          Padding(padding: const EdgeInsets.only(top: 8, bottom: 8), child: Text(artifactError, style: const TextStyle(color: Colors.orangeAccent))),
+        const SizedBox(height: 12),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          if (detail['conclusion'] == 'success' && !artifactsChecked)
+            const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+          ..._downloadButtons(),
+          btn('Rebuild', rebuildCurrent, secondary: true, icon: Icons.replay),
+          btn(busy ? 'Refreshing…' : 'Refresh', busy ? null : refresh, secondary: true, icon: Icons.refresh),
+          if (hasFailure)
+            btn(diagnosing ? 'Diagnosing…' : 'Diagnose failure', diagnosing ? null : diagnoseFailure, secondary: true, icon: Icons.manage_search),
+          if (hasFailure) btn('Retry same run', rerun, secondary: true, icon: Icons.restart_alt),
+          btn('Artifacts', artifacts, secondary: true, icon: Icons.download),
+          btn('Logs', () => web.window.location.assign('/api/github/logs?owner=${widget.run['owner']}&repo=${widget.run['repoName']}&id=${widget.run['id']}'), secondary: true, icon: Icons.list_alt),
+          if (detail['html_url'] != null) btn('GitHub', () => web.window.location.assign(detail['html_url']), secondary: true, icon: Icons.open_in_new),
+        ]),
+        if (diagnosis != null) ...[
+          const SizedBox(height: 12),
+          card(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Build failure diagnosis', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            const SizedBox(height: 6),
+            Text('${diagnosis['summary'] ?? ''}'),
+            if (failedSteps.isEmpty && diagnosis['logArchiveMessage'] != null)
+              Text('GitHub log archive detail: ${diagnosis['logArchiveMessage']}'),
+            for (final f in excerpts)
+              Padding(padding: const EdgeInsets.only(top: 10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('${f['job']} → ${f['step']}', style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.orangeAccent)),
+                const SizedBox(height: 4),
+                SelectableText('${f['excerpt'] ?? 'No matching log excerpt was available. Open Logs for the complete archive.'}', style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+              ])),
+            if (failedSteps.isNotEmpty && excerpts.isEmpty)
+              const Text('GitHub identified a failed step, but its log file could not be matched automatically. Use Logs to download the full archive or GitHub to inspect the run.'),
+          ])),
+        ],
+      ],
+    )),
+  );
+}
 }
 
 class Releases extends StatefulWidget{final Map<String,dynamic>? session;final VoidCallback onLogin;final void Function(String) snack;const Releases({super.key,this.session,required this.onLogin,required this.snack});@override State<Releases> createState()=>_ReleasesState();}
@@ -391,40 +562,40 @@ Future<void>create()async{if(repo.isEmpty||tag.trim().isEmpty)return;setState(()
 @override Widget build(BuildContext c){if(widget.session==null)return shell('SHIP','Releases','Create real GitHub Releases.',card(Column(children:[const Text('Connect GitHub first'),const SizedBox(height:8),btn('Connect GitHub',widget.onLogin,icon:Icons.login)])));return shell('SHIP','Releases','Publish a version after a successful build.',Column(children:[card(Column(children:[DropdownButtonFormField<String>(value:repo.isEmpty?null:repo,decoration:const InputDecoration(labelText:'Repository'),items:repos.map((r)=>DropdownMenuItem(value:r['full_name'] as String,child:Text(r['full_name']))).toList(),onChanged:(v){repo=v??'';get();}),const SizedBox(height:10),TextField(decoration:const InputDecoration(labelText:'Tag name',hintText:'v1.0.0'),onChanged:(v)=>tag=v),const SizedBox(height:10),TextField(decoration:const InputDecoration(labelText:'Release name'),onChanged:(v)=>name=v),const SizedBox(height:10),TextField(minLines:4,maxLines:7,decoration:const InputDecoration(labelText:'Release notes'),onChanged:(v)=>notes=v),const SizedBox(height:10),SwitchListTile(title:const Text('Pre-release'),value:pre,onChanged:(v)=>setState(()=>pre=v)),btn(loading?'Creating…':'Create GitHub Release',loading?null:create,icon:Icons.rocket_launch)])),if(releases.isNotEmpty)...releases.map((r)=>Padding(padding:const EdgeInsets.only(top:10),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(r['name']??r['tag_name'],style:const TextStyle(fontWeight:FontWeight.bold)),Text(r['tag_name']??''),Text(r['published_at']??'Draft',style:const TextStyle(color:Colors.white54))]))))]));}}
 
 class Docs extends StatefulWidget{const Docs({super.key});@override State<Docs>createState()=>_DocsState();}
-class _DocsState extends State<Docs>{String q='';final items=[['Getting Started','Connect GitHub, select a repository, let Project Doctor inspect it, install the workflow and start a build.'],['Automatic setup','WyBuild can add its GitHub Actions workflow through a setup branch and pull request. You do not need to hand-write YAML.'],['Web → Android TWA','Deploy a PWA over HTTPS, provide a manifest and matching Digital Asset Links, then generate a browser-powered TWA APK/AAB without an embedded WebView.'],['Flutter','Flutter projects use the stable Flutter toolchain and can produce APK or AAB artifacts.'],['Android/Gradle','Existing Android projects use their own Gradle wrapper and project configuration.'],['Build logs','Logs come from the original GitHub Actions run, so dependency and Gradle errors are not hidden.'],['Signing','Release signing should be supplied through encrypted CI secrets. Never put keystores or passwords in frontend code.'],['Free beta','No WyBuild subscription is charged during beta. A small monthly build allowance protects shared service resources.'],['Security','GitHub OAuth is used instead of asking users to paste personal access tokens.']];@override Widget build(BuildContext c){final f=items.where((x)=>(x[0]+' '+x[1]).toLowerCase().contains(q.toLowerCase())).toList();return shell('DOCUMENTATION','Docs & Guide','Understand the complete WyBuild flow.',Column(children:[TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search documentation'),onChanged:(v)=>setState(()=>q=v)),const SizedBox(height:12),for(final x in f)Padding(padding:const EdgeInsets.only(bottom:10),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(x[0],style:const TextStyle(fontWeight:FontWeight.bold,fontSize:17)),const SizedBox(height:6),Text(x[1],style:const TextStyle(color:Colors.white60))])))]));}}
+class _DocsState extends State<Docs>{String q='';final items=[['Getting Started','Connect GitHub, select a repository, let Project Doctor inspect it, install the workflow and start a build.'],['Automatic setup','WyBuild can add its GitHub Actions workflow through a setup branch and pull request. You do not need to hand-write YAML.'],['Web → Android TWA','Deploy a PWA over HTTPS, provide a manifest and matching Digital Asset Links, then generate a browser-powered TWA APK/AAB without an embedded WebView.'],['Flutter','Flutter projects use the stable Flutter toolchain and can produce APK or AAB artifacts.'],['Android/Gradle','Existing Android projects use their own Gradle wrapper and project configuration.'],['Build logs','Logs come from the original GitHub Actions run, so dependency and Gradle errors are not hidden.'],['Signing','Release signing should be supplied through encrypted CI secrets. Never put keystores or passwords in frontend code.'],['Free plan','5 distinct projects per calendar month are free. Developer tools remain free; Pro adds unlimited projects and selected Android wrapper features.'],['Security','GitHub OAuth is used instead of asking users to paste personal access tokens.']];@override Widget build(BuildContext c){final f=items.where((x)=>(x[0]+' '+x[1]).toLowerCase().contains(q.toLowerCase())).toList();return shell('DOCUMENTATION','Docs & Guide','Understand the complete WyBuild flow.',Column(children:[TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search documentation'),onChanged:(v)=>setState(()=>q=v)),const SizedBox(height:12),for(final x in f)Padding(padding:const EdgeInsets.only(bottom:10),child:card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(x[0],style:const TextStyle(fontWeight:FontWeight.bold,fontSize:17)),const SizedBox(height:6),Text(x[1],style:const TextStyle(color:Colors.white60))])))]));}}
 
 // Single source of truth for every selectable native feature: which plan
-// tier it needs, a one-line summary (used as a checkbox subtitle on the
-// Projects build page) and a longer technical explanation of how WyBuild
-// actually implements it in the generated Android wrapper (used on the
-// Native Features reference page). Order and FREE/PRO tiers mirror
-// FREE_NATIVE_FEATURES / PRO_NATIVE_FEATURES in api/index.js.
+// Each selectable TWA capability has a short build-menu summary and a longer
+// explanation of what the wrapper can configure versus what the website must do.
 class NativeFeature{final String key,tier,title,short,long;const NativeFeature(this.key,this.tier,this.title,this.short,this.long);}
 const List<NativeFeature> nativeFeatureCatalog=[
-  NativeFeature('INTERNET','FREE','Internet access','Required base permission so the app can load your web content.','WyBuild always adds the INTERNET permission and enables WebView networking, so the generated app can load your bundled web assets and reach any APIs your app calls. This is not optional - every wrapped app needs it.'),
-  NativeFeature('JAVASCRIPT','FREE','JavaScript execution','Legacy WebView shell feature.','Legacy WebView shell feature; TWA uses Chrome to render the website.'),
-  NativeFeature('DOM_STORAGE','FREE','DOM storage','Enables localStorage/sessionStorage for your web app.','Turns on DOM storage (setDomStorageEnabled) so code that relies on localStorage or sessionStorage keeps working the same way it does in a browser tab.'),
-  NativeFeature('BACK_BUTTON','FREE','Back button handling','Android back gesture navigates your app\'s history first.','The wrapper\'s onBackPressed override checks whether the WebView can go back in its own history and does that before falling back to closing the app, matching normal browser-back behavior.'),
-  NativeFeature('FILE_PICKER','FREE','File picker','Native file chooser for <input type=file> uploads.','Implements onShowFileChooser so any HTML file input opens the standard Android file/photo picker and returns the selected file to your page, instead of doing nothing.'),
-  NativeFeature('SHARE','FREE','Native share sheet','Bridge call opens the native Android share sheet.','Exposes WyBuild.share(text) to your JavaScript, which opens Android\'s native share sheet (Intent.ACTION_SEND) so users can send text to other apps.'),
-  NativeFeature('VIBRATION','FREE','Vibration','Bridge call triggers short device vibration.','Exposes WyBuild.vibrate(ms) (clamped to 2 seconds) and adds the VIBRATE permission, letting your JS trigger haptic feedback on supported devices.'),
-  NativeFeature('ORIENTATION','FREE','Orientation lock','Bridge call locks or unlocks screen orientation.','Exposes WyBuild.setOrientation(\'portrait\'|\'landscape\'|\'auto\') to lock the activity to a specific orientation or return it to following the device sensor.'),
-  NativeFeature('BATTERY','FREE','Battery level','Bridge call returns current battery percentage.','Exposes WyBuild.battery(), reading the device\'s BatteryManager to return the current charge percentage as a string to your JS.'),
-  NativeFeature('NETWORK_STATUS','FREE','Network status','Bridge call reports wifi / cellular / offline.','Exposes WyBuild.network(), using ConnectivityManager to tell your JS whether the device is on wifi, cellular data, or offline.'),
-  NativeFeature('DEVICE_INFO','FREE','Device info','Bridge call returns manufacturer, model, Android version.','Exposes WyBuild.device(), returning a string like "Samsung SM-G991B Android 14" so your app can tailor behavior or diagnostics to the device.'),
-  NativeFeature('LOCAL_NOTIFICATIONS','FREE','Local notifications','Bridge call posts a local Android notification.','Exposes WyBuild.notify(title,text) and adds POST_NOTIFICATIONS (Android 13+), creating a notification channel and posting a simple local notification from your JS.'),
-  NativeFeature('CAMERA_MIC','PRO','Camera & microphone','Camera + microphone access for getUserMedia.','Adds CAMERA and RECORD_AUDIO permissions, requests them at launch, and auto-grants WebView permission prompts so navigator.mediaDevices.getUserMedia() works for camera/mic capture in your web app.'),
-  NativeFeature('LOCATION','PRO','Location (GPS)','GPS access for the browser Geolocation API.','Adds ACCESS_FINE_LOCATION and ACCESS_COARSE_LOCATION, requests them at launch, and auto-approves WebView geolocation prompts so navigator.geolocation works without a native permission dialog blocking it.'),
-  NativeFeature('DOWNLOADS','PRO','File downloads','Lets the WebView hand off file downloads.','Registers a DownloadListener that opens a download URL as a system Intent, so files your web app links to open in an external app/browser instead of silently failing inside the WebView.'),
-  NativeFeature('EXTERNAL_LINKS','PRO','External links','http(s) links open in the device\'s default browser.','Overrides WebView URL loading so any http/https link is handed to the system\'s default browser via an Intent, keeping your in-app WebView scoped to your own content.'),
-  NativeFeature('FULLSCREEN','PRO','Fullscreen UI','Hides the status/nav bars for an immersive UI.','Sets Android\'s immersive system UI visibility flags so the status bar and navigation bar are hidden, giving the app a fullscreen, more native feel.'),
-  NativeFeature('BIOMETRIC','PRO','Biometric auth','Bridge call triggers fingerprint/face unlock.','Exposes WyBuild.biometric(), which shows Android\'s BiometricPrompt (fingerprint or face unlock) using androidx.biometric, so your web app can gate a screen or action behind device biometrics.'),
-  NativeFeature('SECURE_STORAGE','PRO','Secure storage','Encrypted on-device key/value storage.','Exposes WyBuild.securePut/secureGet/secureRemove, which AES-GCM encrypt values with a key held in the Android Keystore before saving them to SharedPreferences - useful for tokens or secrets you do not want in plain localStorage.'),
-  NativeFeature('SCREEN_CAPTURE','PRO','Screenshot protection','Blocks screenshots and screen recording.','Sets FLAG_SECURE on the app window, which prevents the OS from taking screenshots or screen-recording the app - useful for screens showing sensitive data. Despite the generic name, selecting this restricts capture rather than enabling it.'),
-  NativeFeature('PICTURE_IN_PICTURE','PRO','Picture-in-picture','Bridge call enters Android Picture-in-Picture mode.','Exposes WyBuild.enterPictureInPicture() (Android 8+) and marks the activity as PiP-capable, so video or call-style content can shrink to a floating window when the user leaves the app.'),
-  NativeFeature('DEEP_LINKS','PRO','Deep links','Registers a wybuild:// deep-link scheme.','Adds a wybuild:// intent filter to the manifest and handles it in the WebView\'s URL loading override, so external links or notifications can open directly into a specific spot in your app.'),
+  NativeFeature('INTERNET','FREE','Internet access','Always enabled for TWA builds.','The generated Android wrapper always declares INTERNET; this is required to load the HTTPS PWA.'),
+  NativeFeature('JAVASCRIPT','FREE','JavaScript execution','Handled by Chrome in a TWA.','Trusted Web Activity content is rendered by the browser. WyBuild does not create a WebView or inject a JavaScript bridge.'),
+  NativeFeature('DOM_STORAGE','FREE','DOM storage','Browser-managed localStorage/sessionStorage.','Storage is managed by Chrome for your website origin. The Android host app cannot directly inspect or inject into that browser storage.'),
+  NativeFeature('BACK_BUTTON','FREE','Android back navigation','Uses the website/browser navigation history.','TWA delegates web content to Chrome. Use normal website history and routing; WyBuild cannot override Chrome navigation with a native WebView bridge.'),
+  NativeFeature('PULL_TO_REFRESH','FREE','Pull-to-refresh gesture','Requires a refresh gesture implemented by the website.','TWA does not expose a native WebView refresh container. Implement pull-to-refresh in your PWA UI if you need this gesture.'),
+  NativeFeature('SWIPE_NAVIGATION','FREE','Swipe navigation gestures','Requires website-side gesture handling.','Custom swipe navigation must be implemented in your web app; selecting this option records the requirement and reports it in the workflow summary.'),
+  NativeFeature('FILE_PICKER','FREE','File picker','Use HTML input type=file; Chrome handles the picker.','Your PWA must include a file input or supported file picker API. The TWA wrapper does not override Chrome file chooser callbacks.'),
+  NativeFeature('SHARE','FREE','Native share sheet','Use the Web Share API from the website.','Your PWA can call navigator.share() after a user gesture on supported browsers; no injected Android bridge is available in TWA.'),
+  NativeFeature('VIBRATION','FREE','Vibration / haptics','Adds VIBRATE permission; website calls navigator.vibrate().','The wrapper declares android.permission.VIBRATE when selected. The website must invoke the browser Vibration API, which may be restricted by device/browser policy.'),
+  NativeFeature('ORIENTATION','FREE','Screen orientation','Website/browser API; availability varies by browser.','Use the Screen Orientation API in your PWA where supported. TWA cannot expose a custom Android orientation-lock bridge.'),
+  NativeFeature('BATTERY','FREE','Battery status','Browser API support is limited and varies.','The Battery Status API is not supported in all browsers for privacy reasons. WyBuild cannot guarantee battery readings from a TWA.'),
+  NativeFeature('NETWORK_STATUS','FREE','Network status','Use navigator.onLine and connection events where available.','Network information APIs vary across browsers. Use navigator.onLine and online/offline events as a fallback.'),
+  NativeFeature('DEVICE_INFO','FREE','Device information','Use privacy-preserving browser capabilities.','A TWA does not expose Android manufacturer/model through a native bridge. Use user-agent client hints only where available and respect privacy limits.'),
+  NativeFeature('LOCAL_NOTIFICATIONS','FREE','Web notifications','Adds Android notification permission declaration; PWA must request permission and configure notifications.','For web push, the site needs a service worker, HTTPS, notification permission and its own push setup. The wrapper permission alone does not create notification delivery.'),
+  NativeFeature('CAMERA_MIC','FREE','Camera & microphone permissions','Adds CAMERA and RECORD_AUDIO declarations; website must request getUserMedia.','Chrome controls runtime prompts and permissions for the website origin. The Android manifest declarations do not bypass browser permission prompts.'),
+  NativeFeature('LOCATION','FREE','Location permissions','Adds coarse/fine location declarations; website must request geolocation.','Chrome controls site-level location permission. The website must call navigator.geolocation and users must grant access.'),
+  NativeFeature('DOWNLOADS','FREE','Downloads','Use browser download links/attributes or supported APIs.','Downloads are handled by Chrome and the website. A TWA does not expose a native DownloadListener bridge.'),
+  NativeFeature('EXTERNAL_LINKS','FREE','External links','Handled by Chrome/TWA scope and Android intents.','Links outside the verified website scope may open in a browser/custom tab. Test external navigation with the real domain and Digital Asset Links.'),
+  NativeFeature('FULLSCREEN','FREE','Fullscreen display','TWA is fullscreen when verified.','When Digital Asset Links verification succeeds, the TWA hides browser UI. If verification fails, Chrome may show browser UI; selecting this cannot bypass verification.'),
+  NativeFeature('BIOMETRIC','PRO','Biometric/passkey authentication','Use WebAuthn/passkeys from the website where supported.','TWA does not provide a custom native BiometricPrompt JavaScript bridge. Use WebAuthn/passkeys and your identity provider instead.'),
+  NativeFeature('SECURE_STORAGE','PRO','Secure data handling','Use server-side sessions and appropriate web security.','TWA cannot expose Android Keystore directly to the website. Do not store secrets in localStorage; use secure server-side session design.'),
+  NativeFeature('SCREEN_CAPTURE','PRO','Screenshot restrictions','Not enforceable reliably from a TWA web page.','A TWA cannot guarantee FLAG_SECURE-style screenshot blocking because the content is rendered by the browser. Do not select this expecting screenshot protection.'),
+  NativeFeature('PICTURE_IN_PICTURE','PRO','Picture-in-picture','Use supported web media/PiP APIs in the website.','The Android host cannot inject a native PiP bridge into Chrome. Browser support and website implementation determine availability.'),
+  NativeFeature('DEEP_LINKS','PRO','Verified HTTPS deep links','Adds an auto-verified HTTPS intent filter for the TWA website host.','The generated wrapper adds an Android App Links intent filter for the entered website host. Publish matching Digital Asset Links and implement route handling in the website.'),
 ];
 String featureShort(String key)=>nativeFeatureCatalog.firstWhere((f)=>f.key==key,orElse:()=>NativeFeature(key,'FREE',key,'','')).short;
+String featureTitle(String key)=>nativeFeatureCatalog.firstWhere((f)=>f.key==key,orElse:()=>NativeFeature(key,'FREE',key,'','')).title;
 
 class NativeFeatures extends StatefulWidget{const NativeFeatures({super.key});@override State<NativeFeatures>createState()=>_NativeFeaturesState();}
 class _NativeFeaturesState extends State<NativeFeatures>{String q='';String? open;
@@ -447,18 +618,39 @@ Widget _section(String label,String sub,List<NativeFeature> items)=>Column(cross
 @override Widget build(BuildContext c){
   final free=nativeFeatureCatalog.where((f)=>f.tier=='FREE').toList();
   final pro=nativeFeatureCatalog.where((f)=>f.tier=='PRO').toList();
-  return shell('REFERENCE','Native Features','Every capability WyBuild can add to a Web → Android wrapper, and how it actually works under the hood.',Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
-    TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search native features'),onChanged:(v)=>setState(()=>q=v)),
-    _section('FREE — always included','Added to every Web → Android build automatically, on every plan.',free),
-    _section('PRO — selectable','Only selectable once the server verifies a Pro or Pro+ entitlement. Pick these on the Projects build page.',pro),
+  return shell('REFERENCE','Native Features','Some Android capabilities are Pro; browser-only capabilities remain free because they depend on the website rather than WyBuild.',Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
+    TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search native features and gestures'),onChanged:(v)=>setState(()=>q=v)),
+    _section('FREE','Available to every developer. Browser-only features still require compatible PWA code.',free.where((f)=>f.key!='INTERNET').toList()),
+    _section('PRO','Paid Android wrapper options. The server enforces these entitlements at build time.',pro),
   ]));
 }}
 
 class Features extends StatefulWidget{const Features({super.key});@override State<Features>createState()=>_FeaturesState();}
-class _FeaturesState extends State<Features>{String q='';int? open;final fs=[['🧠','Automatic project detection','Detect Flutter, Android/Gradle, Vite/React, Node and vanilla HTML.'],['⚙️','One-tap workflow installation','WyBuild creates or updates the GitHub Actions workflow for the repository.'],['🩺','Project Doctor + Play Readiness','Check repository markers, SDK target, release signing, versioning, manifest risks and Play Console tasks before building.'],['📦','APK / AAB generation','Build installable test APKs or signed AABs for Play submission; production AABs require a persistent upload keystore.'],['🌐','Web → Android TWA','A deployed HTTPS PWA can be packaged as a Chrome-powered Trusted Web Activity without embedding a WebView.'],['🆓','Free native bundle','Internet, JavaScript, storage, file picker, sharing, vibration, orientation, battery, network/device info and local notifications are automatically available.'],['⭐','TWA compatibility checks','Checks HTTPS, web manifest, package ID, persistent signing certificate and Digital Asset Links before attempting a TWA build. TWA uses the browser, not an embedded WebView.'],['🔌','Native JavaScript bridge','Generated apps expose a WyBuild bridge for vibration, sharing, battery, network, device info, notifications, orientation, biometric auth, secure storage and PiP.'],['🔍','Real diagnostics','See original workflow status, artifacts and failure details instead of fake progress.'],['🚀','GitHub Releases','Create releases and attach artifacts through GitHub.'],['🔐','Secrets stay server-side','OAuth tokens and billing service secrets are not exposed to the browser.'],['🔔','FCM build alerts','Firebase Cloud Messaging can send success/failure alerts when Firebase is configured and repository secret provisioning succeeds.']];@override Widget build(BuildContext c){final f=fs.where((x)=>x.join(' ').toLowerCase().contains(q.toLowerCase())).toList();return shell('WYBUILD / FEATURES','What WyBuild adds to your build','Automation around the annoying parts of Android CI/CD.',Column(children:[TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search features'),onChanged:(v)=>setState(()=>q=v)),const SizedBox(height:12),for(int i=0;i<f.length;i++)card(Column(children:[ListTile(onTap:()=>setState(()=>open=open==i?null:i),leading:Text(f[i][0],style:const TextStyle(fontSize:23)),title:Text(f[i][1],style:const TextStyle(fontWeight:FontWeight.bold)),subtitle:Text(f[i][2]),trailing:Icon(open==i?Icons.remove:Icons.add)),if(open==i)const Padding(padding:EdgeInsets.all(12),child:Text('WyBuild performs this step inside the authenticated GitHub/CI flow rather than requiring the developer to manually configure every file.'))]))]));}}
+class _FeaturesState extends State<Features>{String q='';int? open;final fs=[['🧠','Automatic project detection','Detect Flutter, Android/Gradle, Vite/React, Node and vanilla HTML.'],['⚙️','One-tap workflow installation','WyBuild creates or updates the GitHub Actions workflow for the repository.'],['🩺','Project Doctor + Play Readiness','Check repository markers, SDK target, release signing, versioning, manifest risks and Play Console tasks before building.'],['📦','APK / AAB generation','Build installable test APKs or signed AABs for Play submission; production AABs require a persistent upload keystore.'],['🌐','Web → Android TWA','A deployed HTTPS PWA can be packaged as a Chrome-powered Trusted Web Activity without embedding a WebView.'],['🆓','Free developer tooling','Base64, SHA-256, HMAC-SHA256, UUIDs, API-key/secret generation, URL tools, JSON formatting and timestamps run locally in the browser.'],['⭐','TWA compatibility checks','Checks HTTPS, web manifest, package ID, signing prerequisites and Digital Asset Links before attempting a TWA build. TWA uses the browser, not an embedded WebView.'],['🔌','TWA-aware feature selection','WyBuild adds supported Android manifest permissions and verified links, and explains website-side API requirements instead of claiming an unavailable native JavaScript bridge.'],['🔍','Real diagnostics','See original workflow status, artifacts and failure details instead of fake progress.'],['🚀','GitHub Releases','Create releases and attach artifacts through GitHub.'],['💳','Simple pricing','5 projects/month are free. Pro is $10/month or $99/year with unlimited projects and selected Pro Android features.'],['🔔','FCM build alerts','Firebase Cloud Messaging can send success/failure alerts when Firebase is configured and repository secret provisioning succeeds.']];@override Widget build(BuildContext c){final f=fs.where((x)=>x.join(' ').toLowerCase().contains(q.toLowerCase())).toList();return shell('WYBUILD / FEATURES','What WyBuild adds to your build','Automation around the annoying parts of Android CI/CD.',Column(children:[TextField(decoration:const InputDecoration(prefixIcon:Icon(Icons.search),hintText:'Search features'),onChanged:(v)=>setState(()=>q=v)),const SizedBox(height:12),for(int i=0;i<f.length;i++)card(Column(children:[ListTile(onTap:()=>setState(()=>open=open==i?null:i),leading:Text(f[i][0],style:const TextStyle(fontSize:23)),title:Text(f[i][1],style:const TextStyle(fontWeight:FontWeight.bold)),subtitle:Text(f[i][2]),trailing:Icon(open==i?Icons.remove:Icons.add)),if(open==i)const Padding(padding:EdgeInsets.all(12),child:Text('WyBuild performs this step inside the authenticated GitHub/CI flow rather than requiring the developer to manually configure every file.'))]))]));}}
 
+class DevTools extends StatefulWidget{const DevTools({super.key});@override State<DevTools>createState()=>_DevToolsState();}
+class _DevToolsState extends State<DevTools>{
+ String tool='Base64 Encode',input='',output='';
+ final rng=Random.secure();
+ final tools={
+  'Encoding & data':['Base64 Encode','Base64 Decode','Base64URL Encode','Base64URL Decode','URL Encode','URL Decode','JSON Format'],
+  'Hashing & crypto':['SHA-256','SHA-1','SHA-512','MD5','HMAC-SHA256'],
+  'Keys & identifiers':['UUID v4','API Key','Random Secret'],
+  'Web / API helpers':['JWT Decode','Unix Timestamp'],
+ };
+ List<String> get flatTools=>tools.values.expand((x)=>x).toList();
+ String randomHex(int n){final b=List<int>.generate(n,(_)=>rng.nextInt(256));return b.map((x)=>x.toRadixString(16).padLeft(2,'0')).join();}
+ String uuid(){final b=List<int>.generate(16,(_)=>rng.nextInt(256));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;final h=b.map((x)=>x.toRadixString(16).padLeft(2,'0')).join();return '${h.substring(0,8)}-${h.substring(8,12)}-${h.substring(12,16)}-${h.substring(16,20)}-${h.substring(20)}';}
+ void run(){try{switch(tool){case 'Base64 Encode':output=base64.encode(utf8.encode(input));break;case 'Base64 Decode':output=utf8.decode(base64.decode(input.trim()));break;case 'Base64URL Encode':output=base64Url.encode(utf8.encode(input));break;case 'Base64URL Decode':output=utf8.decode(base64Url.decode(base64Url.normalize(input.trim())));break;case 'SHA-256':output=sha256.convert(utf8.encode(input)).toString();break;case 'SHA-1':output=sha1.convert(utf8.encode(input)).toString();break;case 'SHA-512':output=sha512.convert(utf8.encode(input)).toString();break;case 'MD5':output=md5.convert(utf8.encode(input)).toString();break;case 'JWT Decode':final jwtParts=input.split('.');if(jwtParts.length!=3)throw FormatException('A JWT must contain three dot-separated parts.');final payload=jsonDecode(utf8.decode(base64Url.decode(base64Url.normalize(jwtParts[1]))));output=const JsonEncoder.withIndent('  ').convert(payload);break;case 'HMAC-SHA256':final hmacParts=input.split('\n');final secret=hmacParts.isEmpty?'':hmacParts.first;final message=hmacParts.length>1?hmacParts.sublist(1).join('\n'):'';output=Hmac(sha256,utf8.encode(secret)).convert(utf8.encode(message)).toString();break;case 'UUID v4':output=uuid();break;case 'API Key':output='wy_${randomHex(24)}';break;case 'Random Secret':output=randomHex(32);break;case 'URL Encode':output=Uri.encodeComponent(input);break;case 'URL Decode':output=Uri.decodeComponent(input);break;case 'JSON Format':final v=jsonDecode(input);output=const JsonEncoder.withIndent('  ').convert(v);break;case 'Unix Timestamp':output=(DateTime.now().millisecondsSinceEpoch~/1000).toString();break;}setState((){});}catch(e){setState(()=>output='Error: $e');}}
+ @override Widget build(BuildContext c)=>shell('FREE DEVELOPER TOOLS','Developer Toolbox','Common encoding, hashing, key and API helpers. Everything runs locally in the browser.',Column(children:[
+  for(final entry in tools.entries) ExpansionTile(title:Text(entry.key,style:const TextStyle(fontWeight:FontWeight.bold)),subtitle:Text('${entry.value.length} tools'),children:[Padding(padding:const EdgeInsets.fromLTRB(12,0,12,12),child:Wrap(spacing:8,runSpacing:8,children:[for(final name in entry.value)ChoiceChip(label:Text(name),selected:tool==name,onSelected:(_)=>setState(()=>tool=name))]))]),
+  const SizedBox(height:8),card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text('Selected tool: $tool',style:const TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:10),if(tool!='UUID v4'&&tool!='API Key'&&tool!='Random Secret'&&tool!='Unix Timestamp')TextField(minLines:5,maxLines:12,decoration:const InputDecoration(labelText:'Input',hintText:'Paste text here'),onChanged:(v)=>input=v),const SizedBox(height:12),btn('Run $tool',run,icon:Icons.play_arrow),if(output.isNotEmpty)...[const SizedBox(height:12),card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Text('Output',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:8),SelectableText(output,style:const TextStyle(fontFamily:'monospace'))]))]])),
+  const SizedBox(height:12),card(const Text('Free tools never send your input to WyBuild. Generated secrets are convenience values only; use a proper secret manager for production credentials.',style:TextStyle(color:Colors.white60)))
+ ]));
+}
 class Billing extends StatefulWidget{final Map<String,dynamic>? session;final VoidCallback onLogin;final void Function(String) snack;const Billing({super.key,this.session,required this.onLogin,required this.snack});@override State<Billing>createState()=>_BillingState();}
-class _BillingState extends State<Billing>{Map? status;bool loading=true;@override void initState(){super.initState();load();}Future<void>load()async{if(widget.session==null){setState(()=>loading=false);return;}try{status=await api.call('/api/billing/status');}catch(e){widget.snack(e.toString());}finally{if(mounted)setState(()=>loading=false);}}@override Widget build(BuildContext c){return shell('WYBUILD / EARLY ACCESS','Free beta','All WyBuild features are free while the build workflow is being validated.',Column(children:[if(loading)const CircularProgressIndicator(),card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Row(children:[Icon(Icons.verified,color:Colors.greenAccent),SizedBox(width:8),Text('FREE BETA',style:TextStyle(fontWeight:FontWeight.bold))]),const SizedBox(height:10),const Text('No subscription, payment method, or paid WyBuild plan is required.',style:TextStyle(fontSize:16)),const SizedBox(height:8),Text('Successful builds used this month: ${status?['buildsUsed']??0} / ${status?['buildLimit']??5}'),Text('Builds currently running: ${status?['inProgressBuilds']??0}'),const SizedBox(height:10),const Text('To protect the service from abuse, the beta has a small monthly build allowance. Builds run in your GitHub repository, so GitHub Actions usage is governed by that repository owner’s GitHub plan.',style:TextStyle(color:Colors.white60))]))]));}}
+class _BillingState extends State<Billing>{Map? status;bool loading=true;@override void initState(){super.initState();load();}Future<void>load()async{if(widget.session==null){setState(()=>loading=false);return;}try{status=await api.call('/api/billing/status');}catch(e){widget.snack(e.toString());}finally{if(mounted)setState(()=>loading=false);}}void openCheckout(String? url){if(url==null||url.isEmpty){widget.snack('Checkout is not configured yet. Set WYBUILD_PRO_MONTHLY_URL or WYBUILD_PRO_YEARLY_URL in Vercel.');return;}final uid=widget.session?['user']?['id']?.toString()??'';web.window.open(url.replaceAll('{USER_ID}',Uri.encodeComponent(uid)),'_blank');}@override Widget build(BuildContext c){final pro=status?['plan']=='PRO';final used=status?['projectsUsed']??0;final limit=status?['projectLimit'];return shell('WYBUILD / PLANS','Simple developer pricing','Keep useful developer tools free; charge only for project capacity and selected Android features.',Column(children:[if(loading)const CircularProgressIndicator(),card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text(pro?'PRO PLAN':'FREE PLAN',style:const TextStyle(fontWeight:FontWeight.bold,fontSize:18)),const SizedBox(height:8),Text(pro?'Unlimited projects.':'$used / ${limit??5} projects used this month.'),const SizedBox(height:14),const Text('FREE',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:4),const Text('5 projects per calendar month • Free developer tools • Core TWA features • Diagnostics and build tooling.'),const SizedBox(height:14),const Text('PRO',style:TextStyle(fontWeight:FontWeight.bold)),const SizedBox(height:4),const Text('\$10/month or \$99/year • Unlimited projects • Pro Android features • Higher build concurrency.'),const SizedBox(height:14),if(!pro)Row(children:[Expanded(child:btn('\$10/month',()=>openCheckout(status?['checkoutMonthlyUrl']?.toString()),icon:Icons.credit_card)),const SizedBox(width:10),Expanded(child:btn('\$99/year',()=>openCheckout(status?['checkoutYearlyUrl']?.toString()),secondary:true,icon:Icons.calendar_month))]) else const Text('Your Pro entitlement is active.',style:TextStyle(color:Colors.greenAccent)),const SizedBox(height:12),const Text('Payments are handled by your configured checkout provider. WyBuild never stores card details. The signed billing webhook updates the Pro entitlement server-side.',style:TextStyle(color:Colors.white60,fontSize:12))]))]));}}
+
 class Settings extends StatelessWidget{final Map<String,dynamic>? session;final VoidCallback onLogin;final void Function(String) snack;const Settings({super.key,this.session,required this.onLogin,required this.snack});Future<void> enablePush() async {try{final token=(await wybuildEnablePush().toDart).toDart;await api.call('/api/notifications/register',method:'POST',body:{'token':token});snack('Build push notifications enabled for this browser.');}catch(e){snack(e.toString().replaceFirst('Exception: ',''));}}@override Widget build(BuildContext c)=>shell('ACCOUNT','Settings','GitHub connection, build alerts and security.',Column(children:[card(Column(crossAxisAlignment:CrossAxisAlignment.start,children:[const Text('GitHub',style:TextStyle(fontWeight:FontWeight.bold,fontSize:18)),Text(session==null?'Not connected.':'Connected as @${session!['user']['login']}'),const SizedBox(height:10),btn(session==null?'Connect GitHub':'Disconnect GitHub',session==null?onLogin:()async{try{await api.logout();web.window.location.reload();}catch(e){snack(e.toString());}},icon:session==null?Icons.login:Icons.link_off),if(session!=null) ...[const SizedBox(height:10),btn('Enable build push notifications',enablePush,secondary:true,icon:Icons.notifications_active_outlined),const SizedBox(height:6),const Text('Get a push notification when a WyBuild workflow succeeds or fails. This requires Firebase setup by the WyBuild administrator.',style:TextStyle(color:Colors.white60))]])),const SizedBox(height:12),card(const Column(crossAxisAlignment:CrossAxisAlignment.start,children:[Text('Security',style:TextStyle(fontWeight:FontWeight.bold,fontSize:18)),SizedBox(height:6),Text('GitHub tokens stay inside the server-side session. Firebase service-account credentials stay server-side in Vercel; only public Firebase web configuration belongs in web/firebase-config.js.')]))]));}
 
 class Help extends StatelessWidget{final void Function(String) go;const Help({super.key,required this.go});@override Widget build(BuildContext c)=>shell('SUPPORT','Help','Recovery paths for common WyBuild problems.',Column(children:[card(const _HelpItem('GitHub connection failed','Check OAuth credentials, callback URL and repository permissions. Reconnect after fixing them.')),card(const _HelpItem('Workflow not found','Open Projects → Project Doctor → Install / update workflow. GitHub manual dispatch requires the workflow on the default branch.')),card(const _HelpItem('Web → APK failed','Confirm the web project produces a static index.html. Next.js server output needs a static export or an existing Android wrapper.')),card(const _HelpItem('Build failed','Open the original GitHub Actions logs. WyBuild should expose the failing stage instead of hiding it.')),btn('Open Docs',()=>go('docs'),secondary:true,icon:Icons.menu_book)]));}

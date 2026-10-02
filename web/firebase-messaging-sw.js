@@ -1,7 +1,7 @@
 /* Firebase Cloud Messaging background worker for WyBuild. */
 importScripts('/firebase-config.js');
-importScripts('https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js');
-importScripts('https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js');
+importScripts('https://www.gstatic.com/firebasejs/12.19.0/firebase-app-compat.js');
+importScripts('https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging-compat.js');
 if (self.WYBUILD_FIREBASE_CONFIG && self.WYBUILD_FIREBASE_CONFIG.apiKey && !self.WYBUILD_FIREBASE_CONFIG.apiKey.startsWith('REPLACE_')) {
   firebase.initializeApp(self.WYBUILD_FIREBASE_CONFIG);
   const messaging = firebase.messaging();

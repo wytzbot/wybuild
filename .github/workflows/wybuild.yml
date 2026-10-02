@@ -1,4 +1,4 @@
-# wybuild-workflow-version: 30
+# wybuild-workflow-version: 37
 name: WyBuild
 on:
   workflow_dispatch:
@@ -16,10 +16,10 @@ on:
         options: [debug, release]
         default: release
       native_features:
-        description: Native Web-to-App features (server-authorized)
+        description: TWA features; supported Android permissions and deep links are generated
         required: false
         type: string
-        default: free
+        default: ''
       web_app_url:
         description: Deployed HTTPS PWA URL for TWA builds
         required: false
@@ -35,13 +35,18 @@ on:
         required: false
         type: string
         default: My App
+      wybuild_request_id:
+        description: Internal WyBuild request correlation ID
+        required: false
+        type: string
+        default: ''
       twa_output:
         description: TWA artifact format
         required: false
         type: choice
         options: [apk, aab]
         default: apk
-run-name: "WyBuild: ${{ inputs.build_type }} (${{ inputs.build_mode }}) [${{ inputs.native_features }}] on ${{ github.ref_name }}"
+run-name: "WyBuild: ${{ inputs.build_type }} (${{ inputs.build_mode }}) [${{ inputs.native_features }}] [${{ inputs.wybuild_request_id }}] on ${{ github.ref_name }}"
 permissions:
   contents: read
 concurrency:
@@ -53,7 +58,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        id: checkout
+        uses: actions/checkout@v7
       - name: Detect project type
         id: detect
         shell: bash
@@ -67,25 +73,29 @@ jobs:
           else type=unknown; fi
           echo "type=$type" >> "$GITHUB_OUTPUT"
       - name: Validate requested target
+        id: validate_target
         shell: bash
         env:
           REQUESTED: ${{ inputs.build_type }}
           DETECTED: ${{ steps.detect.outputs.type }}
         run: |
           set -euo pipefail
+          if [ "$REQUESTED" = twa ] && [ "${{ inputs.build_mode }}" = debug ]; then echo '::error::TWA debug builds are not supported by Bubblewrap; select Release for TWA APK/AAB.'; exit 1; fi
           if [ "$REQUESTED" = twa ]; then exit 0; fi
           if [ "$DETECTED" = unknown ]; then echo '::error::Unsupported project'; exit 1; fi
           if { [ "$DETECTED" = node-web ] || [ "$DETECTED" = vanilla ] || [ "$DETECTED" = next ]; } && { [ "$REQUESTED" = apk ] || [ "$REQUESTED" = aab ]; }; then echo '::error::Web projects are never packaged in a WebView. Deploy your PWA over HTTPS and select the TWA target.'; exit 1; fi
           if [ "$REQUESTED" = web ] && { [ "$DETECTED" = flutter ] || [ "$DETECTED" = gradle ]; }; then echo '::error::Web target unavailable for native project'; exit 1; fi
           if [ "$DETECTED" = next ] && [ "$REQUESTED" != web ] && [ "$REQUESTED" != auto ]; then echo '::error::Next.js requires static export for APK/AAB'; exit 1; fi
       - name: Validate Play release signing prerequisites
-        if: inputs.build_mode == 'release' && (inputs.build_type == 'aab' || (inputs.build_type == 'twa' && inputs.twa_output == 'aab'))
+        id: validate_signing
+        if: inputs.build_mode == 'release' && (inputs.build_type == 'aab' || inputs.build_type == 'twa')
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_PLAY_APP_SIGNING_SHA256: ${{ secrets.ANDROID_PLAY_APP_SIGNING_SHA256 }}
         run: |
           set -euo pipefail
           for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_STORE_PASSWORD; do
@@ -94,58 +104,79 @@ jobs:
               exit 1
             fi
           done
+          if [ '${{ inputs.build_type }}' = 'twa' ] && [ '${{ inputs.twa_output }}' = 'aab' ] && [ -z "${ANDROID_PLAY_APP_SIGNING_SHA256:-}" ]; then
+            echo '::error::A Play-ready TWA AAB also requires ANDROID_PLAY_APP_SIGNING_SHA256. Get the SHA-256 certificate fingerprint from Play Console → Release → Setup → App signing; Google Play re-signs distributed APKs with the Play app-signing key.'
+            exit 1
+          fi
 
       - name: Set up Java (native Android project)
+        id: setup_java_native
         if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
       - name: Set up Java (web wrapper)
+        id: setup_java_web
         if: steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
       - name: Set up Flutter
+        id: setup_flutter
         if: steps.detect.outputs.type == 'flutter'
         uses: subosito/flutter-action@v2.23.0
         with:
+          flutter-version: '3.47.0'
           channel: stable
           cache: true
       - name: Build Flutter Android
+        id: build_flutter
         if: steps.detect.outputs.type == 'flutter' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto')
         shell: bash
         run: |
           set -euo pipefail
           flutter pub get
-          if [ '${{ inputs.build_type }}' = aab ]; then flutter build appbundle --release
-          elif [ '${{ inputs.build_type }}' = apk ] && [ '${{ inputs.build_mode }}' = debug ]; then flutter build apk --debug
+          if [ '${{ inputs.build_type }}' = auto ]; then
+            if [ '${{ inputs.build_mode }}' = debug ]; then flutter build apk --debug; flutter build appbundle --debug
+            else flutter build apk --release; flutter build appbundle --release; fi
+          elif [ '${{ inputs.build_type }}' = aab ] && [ '${{ inputs.build_mode }}' = debug ]; then flutter build appbundle --debug
+          elif [ '${{ inputs.build_type }}' = aab ]; then flutter build appbundle --release
+          elif [ '${{ inputs.build_mode }}' = debug ]; then flutter build apk --debug
           else flutter build apk --release; fi
       - name: Build existing Gradle Android project
+        id: build_gradle
         if: steps.detect.outputs.type == 'gradle' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto')
         shell: bash
         run: |
           set -euo pipefail
           wrapper="$(find . -type f -name gradlew -not -path './.git/*' -not -path '*/node_modules/*' | head -n 1)"
           cd "$(dirname "$wrapper")"; chmod +x ./gradlew
-          if [ '${{ inputs.build_type }}' = aab ]; then ./gradlew bundleRelease --no-daemon --stacktrace
-          elif [ '${{ inputs.build_type }}' = apk ] && [ '${{ inputs.build_mode }}' = debug ]; then ./gradlew assembleDebug --no-daemon --stacktrace
+          if [ '${{ inputs.build_type }}' = auto ]; then
+            if [ '${{ inputs.build_mode }}' = debug ]; then ./gradlew assembleDebug bundleDebug --no-daemon --stacktrace
+            else ./gradlew assembleRelease bundleRelease --no-daemon --stacktrace; fi
+          elif [ '${{ inputs.build_type }}' = aab ] && [ '${{ inputs.build_mode }}' = debug ]; then ./gradlew bundleDebug --no-daemon --stacktrace
+          elif [ '${{ inputs.build_type }}' = aab ]; then ./gradlew bundleRelease --no-daemon --stacktrace
+          elif [ '${{ inputs.build_mode }}' = debug ]; then ./gradlew assembleDebug --no-daemon --stacktrace
           else ./gradlew assembleRelease --no-daemon --stacktrace; fi
       - name: Set up Node.js
+        id: setup_node
         if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' && 'npm' || '' }}
       - name: Install Node dependencies
+        id: install_node_deps
         if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
         shell: bash
         run: |
           set -euo pipefail
           if [ -f package-lock.json ]; then npm ci; elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile; elif [ -f yarn.lock ]; then corepack enable && yarn install --immutable; else npm install; fi
       - name: Build static web output
+        id: build_web
         if: (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla') && (inputs.build_type == 'web' || inputs.build_type == 'auto')
         shell: bash
         run: |
@@ -159,25 +190,54 @@ jobs:
           elif [ -f web/index.html ]; then rsync -a --exclude node_modules --exclude .git --exclude wybuild-output web/ wybuild-output/
           else echo '::error::No static output found'; exit 1; fi
           test -f wybuild-output/index.html || { echo '::error::Static output has no index.html'; exit 1; }
-      - name: Set up Java for TWA
+      - name: Set up Node.js for Bubblewrap TWA
+        id: setup_node_twa
         if: inputs.build_type == 'twa'
-        uses: actions/setup-java@v4
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Set up Java for Bubblewrap TWA
+        id: setup_java_twa
+        if: inputs.build_type == 'twa'
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
-      - name: Set up Gradle for TWA
+      - name: Set up Android SDK for Bubblewrap TWA
+        id: setup_sdk_twa
         if: inputs.build_type == 'twa'
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
-      - name: Set up Android SDK for TWA
-        if: inputs.build_type == 'twa'
-        uses: android-actions/setup-android@v3
-      - name: Install Android 16 SDK for TWA
+        uses: android-actions/setup-android@v4
+      - name: Install Android 16 SDK for Bubblewrap TWA
+        id: install_sdk_twa
         if: inputs.build_type == 'twa'
         shell: bash
-        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
-      - name: Validate TWA prerequisites and build TWA
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+      - name: Verify TWA build engines
+        id: verify_engines_twa
+        if: inputs.build_type == 'twa'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Node: $(node --version)"
+          echo "Java: $(java -version 2>&1 | head -n 1)"
+          echo "Gradle (runner tool): $(gradle --version 2>/dev/null | awk '/Gradle /{print $2; exit}' || true)"
+          echo "Bubblewrap will supply its generated Gradle project."
+          test "$(node -p 'process.versions.node.split(".")[0]')" -ge 20 || { echo '::error::Node.js 20+ is required by WyBuild CI.'; exit 1; }
+          java -version 2>&1 | grep -Eq 'version "17([.]|$)' || { echo '::error::Bubblewrap TWA builds require JDK 17; higher JDKs are not used for TWA generation.'; exit 1; }
+          sdkmanager --list_installed | grep -q 'platforms;android-36' || { echo '::error::Android API 36 platform was not installed.'; exit 1; }
+          sdkmanager --list_installed | grep -q 'build-tools;36.0.0' || { echo '::error::Android Build Tools 36.0.0 were not installed.'; exit 1; }
+      - name: Install Bubblewrap CLI
+        id: install_bubblewrap
+        if: inputs.build_type == 'twa'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @bubblewrap/cli@1.25.0
+          bubblewrap --version
+      - name: Validate and build TWA with Bubblewrap
+        id: build_twa
         if: inputs.build_type == 'twa'
         shell: bash
         env:
@@ -185,108 +245,203 @@ jobs:
           APP_ID: ${{ inputs.app_id }}
           APP_NAME: ${{ inputs.app_name }}
           TWA_OUTPUT: ${{ inputs.twa_output }}
+          NATIVE_FEATURES: ${{ inputs.native_features }}
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_PLAY_APP_SIGNING_SHA256: ${{ secrets.ANDROID_PLAY_APP_SIGNING_SHA256 }}
         run: |
           set -euo pipefail
           python3 - <<'PYCODE'
-          import os, re, urllib.request, json
+          import base64, json, os, pathlib, re, subprocess, urllib.request
           from urllib.parse import urlparse
-          url=os.environ.get('WEB_APP_URL','').strip().rstrip('/')
-          app_id=os.environ.get('APP_ID','').strip()
-          parsed_url=urlparse(url)
-          origin=f'{parsed_url.scheme}://{parsed_url.netloc}'
-          if not url.startswith('https://'): raise SystemExit('::error::TWA requires a deployed HTTPS website URL.')
-          app_name=os.environ.get('APP_NAME','').strip()
-          if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+', app_id): raise SystemExit('::error::Invalid Android package ID.')
-          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}', app_name): raise SystemExit('::error::App name must be 1-40 letters, numbers, spaces, dots, underscores or hyphens.')
-          manifest=None
-          for path in ['/manifest.json','/manifest.webmanifest']:
+
+          url = os.environ.get('WEB_APP_URL','').strip().rstrip('/')
+          app_id = os.environ.get('APP_ID','').strip()
+          app_name = os.environ.get('APP_NAME','').strip()
+          parsed = urlparse(url)
+          if parsed.scheme != 'https' or not parsed.netloc:
+              raise SystemExit('::error::TWA requires a deployed HTTPS website URL.')
+          if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+', app_id):
+              raise SystemExit('::error::Invalid Android package ID. Use a value such as com.example.myapp.')
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}', app_name):
+              raise SystemExit('::error::App name must be 1-40 letters, numbers, spaces, dots, underscores or hyphens.')
+          secrets = ['ANDROID_KEYSTORE_BASE64','ANDROID_KEY_ALIAS','ANDROID_KEY_PASSWORD','ANDROID_STORE_PASSWORD']
+          missing = [x for x in secrets if not os.environ.get(x)]
+          if missing:
+              raise SystemExit('::error::A release TWA requires a persistent signing keystore. Missing: '+', '.join(missing)+'.')
+          if os.environ.get('TWA_OUTPUT') == 'aab' and not os.environ.get('ANDROID_PLAY_APP_SIGNING_SHA256'):
+              raise SystemExit('::error::A Play-ready TWA AAB also requires ANDROID_PLAY_APP_SIGNING_SHA256. Use the SHA-256 certificate fingerprint from Play Console → Release → Setup → App signing, because Google Play re-signs distributed APKs with the Play app-signing key.')
+
+          def get_json(candidate):
               try:
-                  with urllib.request.urlopen(url+path, timeout=15) as r: manifest=json.loads(r.read().decode())
+                  with urllib.request.urlopen(candidate, timeout=20) as r:
+                      return json.loads(r.read().decode('utf-8'))
+              except Exception:
+                  return None
+
+          manifest = None
+          manifest_url = None
+          for suffix in ('/manifest.json','/manifest.webmanifest'):
+              candidate = url + suffix
+              data = get_json(candidate)
+              if isinstance(data, dict):
+                  manifest, manifest_url = data, candidate
                   break
-              except Exception: pass
-          if not isinstance(manifest, dict): raise SystemExit('::error::Could not load a valid manifest.json or manifest.webmanifest at the website root.')
-          if not all(os.environ.get(k) for k in ['ANDROID_KEYSTORE_BASE64','ANDROID_KEY_ALIAS','ANDROID_KEY_PASSWORD','ANDROID_STORE_PASSWORD']):
-              raise SystemExit('::error::TWA requires a persistent signing keystore. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD and ANDROID_STORE_PASSWORD to repository Actions secrets.')
-          import subprocess
-          keystore='/tmp/wybuild-twa-signing.jks'
-          with open(keystore,'wb') as f: f.write(__import__('base64').b64decode(os.environ['ANDROID_KEYSTORE_BASE64']))
-          cert=subprocess.run(['keytool','-list','-v','-keystore',keystore,'-storepass',os.environ['ANDROID_STORE_PASSWORD'],'-alias',os.environ['ANDROID_KEY_ALIAS']],capture_output=True,text=True)
-          if cert.returncode: raise SystemExit('::error::Could not read the configured signing certificate. Check the keystore, alias and store password.')
-          match=re.search(r'SHA256:\s*([0-9A-Fa-f:]{32,})',cert.stdout)
-          if not match: raise SystemExit('::error::Could not extract the signing certificate SHA-256 fingerprint.')
-          fingerprint=match.group(1).upper()
+          if not manifest:
+              raise SystemExit('::error::Could not load a valid manifest.json or manifest.webmanifest at the deployed website root. Bubblewrap needs the PWA manifest.')
+          icons = manifest.get('icons') or []
+          icon = next((i for i in icons if isinstance(i,dict) and isinstance(i.get('src'),str) and i.get('src')), None)
+          if not icon:
+              raise SystemExit('::error::The deployed PWA manifest has no usable icon. Add at least one manifest icon before building the TWA.')
+          icon_url = urllib.request.urljoin(manifest_url, icon['src'])
           try:
-              with urllib.request.urlopen(origin+'/.well-known/assetlinks.json', timeout=15) as r: links=json.loads(r.read().decode())
-          except Exception: raise SystemExit('::error::Publish /.well-known/assetlinks.json with your package ID and signing certificate SHA-256 fingerprint before building a verified TWA.')
-          verified=any(item.get('target',{}).get('namespace')=='android_app' and item.get('target',{}).get('package_name')==app_id and 'delegate_permission/common.handle_all_urls' in item.get('relation',[]) and fingerprint in [str(x).upper() for x in item.get('target',{}).get('sha256_cert_fingerprints',[])] for item in links if isinstance(item,dict)) if isinstance(links,list) else False
-          if not verified: raise SystemExit('::error::Digital Asset Links does not match this package ID and signing certificate fingerprint. Update assetlinks.json, then rebuild.')
-          print('PWA manifest, persistent signing key and Digital Asset Links verified.')
+              with urllib.request.urlopen(icon_url, timeout=20) as r:
+                  if int(r.headers.get('Content-Length') or 1) <= 0:
+                      raise ValueError('empty icon')
+          except Exception as exc:
+              raise SystemExit(f'::error::Bubblewrap could not reach the PWA icon URL {icon_url}. Detail: {exc}')
+
+          start = urllib.request.urljoin(url + '/', str(manifest.get('start_url') or '/'))
+          start_parsed = urlparse(start)
+          start_path = start_parsed.path or '/'
+          if start_parsed.query:
+              start_path += '?' + start_parsed.query
+          scope = urllib.request.urljoin(url + '/', str(manifest.get('scope') or '/'))
+          origin = f'{parsed.scheme}://{parsed.netloc}'
+          version_code = int(os.environ.get('GITHUB_RUN_NUMBER') or '1')
+          selected = {x.strip().upper() for x in os.environ.get('NATIVE_FEATURES','').split(',') if x.strip()}
+          allowed = {'JAVASCRIPT','DOM_STORAGE','BACK_BUTTON','PULL_TO_REFRESH','SWIPE_NAVIGATION','FILE_PICKER','SHARE','VIBRATION','ORIENTATION','BATTERY','NETWORK_STATUS','DEVICE_INFO','LOCAL_NOTIFICATIONS','CAMERA_MIC','LOCATION','DOWNLOADS','EXTERNAL_LINKS','FULLSCREEN','BIOMETRIC','SECURE_STORAGE','SCREEN_CAPTURE','PICTURE_IN_PICTURE','DEEP_LINKS'}
+          unknown = selected - allowed
+          if unknown:
+              raise SystemExit('::error::Unknown native feature key(s): '+', '.join(sorted(unknown))+'. Update WyBuild and reinstall/update the workflow.')
+
+          key_path = pathlib.Path('/tmp/wybuild-twa-signing.jks')
+          key_path.write_bytes(base64.b64decode(os.environ['ANDROID_KEYSTORE_BASE64']))
+          cert = subprocess.run(['keytool','-list','-v','-keystore',str(key_path),'-storepass',os.environ['ANDROID_STORE_PASSWORD'],'-alias',os.environ['ANDROID_KEY_ALIAS']],capture_output=True,text=True)
+          if cert.returncode:
+              raise SystemExit('::error::Could not read the configured signing certificate. Check the keystore, alias and store password.')
+          match = re.search(r'SHA256:\s*([0-9A-Fa-f:]{32,})', cert.stdout)
+          if not match:
+              raise SystemExit('::error::Could not extract the signing certificate SHA-256 fingerprint from the configured keystore.')
+          fingerprint = match.group(1).upper()
+
+          links = get_json(origin+'/.well-known/assetlinks.json')
+          required_fingerprint = os.environ.get('ANDROID_PLAY_APP_SIGNING_SHA256','').replace(':','').upper() if os.environ.get('TWA_OUTPUT') == 'aab' else fingerprint.replace(':','').upper()
+          if required_fingerprint and not re.fullmatch(r'[0-9A-F]{64}', required_fingerprint):
+              raise SystemExit('::error::ANDROID_PLAY_APP_SIGNING_SHA256 must be a 64-hex-character SHA-256 fingerprint, with or without colons.')
+          verified = isinstance(links,list) and any(
+              isinstance(item,dict)
+              and item.get('target',{}).get('namespace') == 'android_app'
+              and item.get('target',{}).get('package_name') == app_id
+              and 'delegate_permission/common.handle_all_urls' in item.get('relation',[])
+              and required_fingerprint in [str(x).replace(':','').upper() for x in item.get('target',{}).get('sha256_cert_fingerprints',[])]
+              for item in links
+          )
+          if not verified:
+              detail = 'the Play app-signing certificate fingerprint' if os.environ.get('TWA_OUTPUT') == 'aab' else 'the configured signing certificate fingerprint'
+              raise SystemExit(f'::error::Digital Asset Links does not match this package ID and {detail}. Publish /.well-known/assetlinks.json with the exact package ID and SHA-256 fingerprint, then rebuild.')
+
+          twa = {
+              'packageId': app_id,
+              'host': parsed.hostname,
+              'name': app_name,
+              'launcherName': app_name[:12],
+              'display': manifest.get('display') or 'standalone',
+              'displayOverride': manifest.get('display_override') or [],
+              'themeColor': manifest.get('theme_color') if isinstance(manifest.get('theme_color'),str) and re.fullmatch(r'#[0-9A-Fa-f]{6,8}', manifest.get('theme_color')) else '#FFFFFF',
+              'themeColorDark': '#000000',
+              'navigationColor': manifest.get('background_color') if isinstance(manifest.get('background_color'),str) and re.fullmatch(r'#[0-9A-Fa-f]{6,8}', manifest.get('background_color')) else '#000000',
+              'navigationColorDark': '#000000',
+              'navigationDividerColor': '#00000000',
+              'navigationDividerColorDark': '#00000000',
+              'backgroundColor': manifest.get('background_color') if isinstance(manifest.get('background_color'),str) and re.fullmatch(r'#[0-9A-Fa-f]{6,8}', manifest.get('background_color')) else '#FFFFFF',
+              'enableNotifications': 'LOCAL_NOTIFICATIONS' in selected,
+              'startUrl': start_path,
+              'iconUrl': icon_url,
+              'maskableIconUrl': next((urllib.request.urljoin(manifest_url,i['src']) for i in icons if isinstance(i,dict) and i.get('purpose') and 'maskable' in str(i.get('purpose')).split() and i.get('src')), None),
+              'monochromeIconUrl': next((urllib.request.urljoin(manifest_url,i['src']) for i in icons if isinstance(i,dict) and i.get('purpose') and 'monochrome' in str(i.get('purpose')).split() and i.get('src')), None),
+              'splashScreenFadeOutDuration': 300,
+              'signingKey': {'path': str(key_path), 'alias': os.environ['ANDROID_KEY_ALIAS']},
+              'appVersionCode': version_code,
+              'appVersion': f'1.0.{version_code}',
+              'shortcuts': manifest.get('shortcuts') or [],
+              'generatorApp': 'bubblewrap-cli',
+              'webManifestUrl': manifest_url,
+              'fallbackType': 'customtabs',
+              'features': {},
+              'alphaDependencies': {'enabled': False},
+              'enableSiteSettingsShortcut': True,
+              'isChromeOSOnly': False,
+              'isMetaQuest': False,
+              'fullScopeUrl': scope,
+              'minSdkVersion': 21,
+              'orientation': manifest.get('orientation') or 'default',
+              'fingerprints': [],
+              'additionalTrustedOrigins': [],
+          }
+          pathlib.Path('twa-app').mkdir(exist_ok=True)
+          pathlib.Path('twa-app/twa-manifest.json').write_text(json.dumps(twa, indent=2)+'\n')
+          print('PWA manifest, icon, persistent signing key and Digital Asset Links verified.')
+          print('Bubblewrap manifest written for', app_id, parsed.hostname)
           PYCODE
-          mkdir -p twa-app/app/src/main/java/com/wybuild/twa twa-app/app/src/main/res/values
-          cat > twa-app/settings.gradle <<'EOF'
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
-          rootProject.name = "WyBuildTwa"
-          include(":app")
-          EOF
-          cat > twa-app/build.gradle <<'EOF'
-          plugins { id 'com.android.application' version '8.9.1' apply false }
-          EOF
-          cat > twa-app/gradle.properties <<'EOF'
-          android.useAndroidX=true
-          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
-          EOF
-          cat > twa-app/app/build.gradle <<'EOF'
-          plugins { id 'com.android.application' }
-          android { namespace 'com.wybuild.twa'; compileSdk 36; defaultConfig { applicationId System.getenv('APP_ID'); minSdk 23; targetSdk 36; versionCode (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger(); versionName '1.0.0' } }
-          dependencies { implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0' }
-          EOF
-          cat > twa-app/app/src/main/AndroidManifest.xml <<'EOF'
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <uses-permission android:name="android.permission.INTERNET" />
-            <application android:label="__APP_NAME__" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false">
-              <meta-data android:name="asset_statements" android:resource="@string/asset_statements" />
-              <activity android:name="com.google.androidbrowserhelper.trusted.LauncherActivity" android:exported="true" android:label="__APP_NAME__">
-                <meta-data android:name="android.support.customtabs.trusted.DEFAULT_URL" android:value="__WEB_APP_URL__" />
-                <meta-data android:name="android.support.customtabs.trusted.STATUS_BAR_COLOR" android:resource="@color/colorPrimary" />
-                <meta-data android:name="android.support.customtabs.trusted.NAVIGATION_BAR_COLOR" android:resource="@color/navigationColor" />
-                <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
-              </activity>
-            </application>
-          </manifest>
-          EOF
-          cat > twa-app/app/src/main/res/values/colors.xml <<'EOF'
-          <resources>
-            <color name="colorPrimary">#111827</color>
-            <color name="navigationColor">#111827</color>
-          </resources>
-          EOF
-          cat > twa-app/app/src/main/res/values/strings.xml <<'EOF'
-          <resources>
-            <string name="asset_statements" translatable="false">[{&quot;include&quot;: &quot;__WEB_ORIGIN__/.well-known/assetlinks.json&quot;}]</string>
-          </resources>
-          EOF
+
+          rm -rf twa-app/app twa-app/gradle twa-app/gradlew twa-app/gradlew.bat
+          bubblewrap updateConfig --jdkPath="$JAVA_HOME" --androidSdkPath="$ANDROID_HOME"
+          cd twa-app
+          bubblewrap update --skipVersionUpgrade --manifest=twa-manifest.json
+          bubblewrap doctor
+          cd ..
+
           python3 - <<'PYCODE'
           import os, pathlib
-          root=pathlib.Path('twa-app')
-          for p in root.rglob('*'):
-              if p.is_file():
-                  t=p.read_text()
-                  t=t.replace('__APP_NAME__',os.environ['APP_NAME'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'))
-                  t=t.replace('__WEB_APP_URL__',os.environ['WEB_APP_URL'].rstrip('/'))
-                  from urllib.parse import urlparse
-                  parsed=urlparse(os.environ['WEB_APP_URL'])
-                  t=t.replace('__WEB_ORIGIN__', f'{parsed.scheme}://{parsed.netloc}')
-                  p.write_text(t)
+          from urllib.parse import urlparse
+          root = pathlib.Path('twa-app')
+          manifest_path = root/'app/src/main/AndroidManifest.xml'
+          manifest = manifest_path.read_text()
+          selected = {x.strip().upper() for x in os.environ.get('NATIVE_FEATURES','').split(',') if x.strip()}
+          parsed = urlparse(os.environ['WEB_APP_URL'].rstrip('/'))
+          permissions = []
+          if 'CAMERA_MIC' in selected: permissions += ['android.permission.CAMERA','android.permission.RECORD_AUDIO']
+          if 'LOCATION' in selected: permissions += ['android.permission.ACCESS_COARSE_LOCATION','android.permission.ACCESS_FINE_LOCATION']
+          if 'VIBRATION' in selected: permissions += ['android.permission.VIBRATE']
+          if 'LOCAL_NOTIFICATIONS' in selected: permissions += ['android.permission.POST_NOTIFICATIONS']
+          marker = '<uses-permission android:name="android.permission.INTERNET" />'
+          extra = ''.join(f'\n  <uses-permission android:name="{p}" />' for p in dict.fromkeys(permissions))
+          if extra and extra.strip() not in manifest:
+              manifest = manifest.replace(marker, marker + extra, 1)
+          if 'DEEP_LINKS' not in selected:
+              import re
+              manifest = re.sub(r'\n\s*<intent-filter android:autoVerify=\"true\">\s*<action android:name=\"android\.intent\.action\.VIEW\"\s*/>\s*<category android:name=\"android\.intent\.category\.DEFAULT\"\s*/>\s*<category android:name=\"android\.intent\.category\.BROWSABLE\"\s*/>\s*<data android:scheme=\"https\" android:host=\"@string/hostName\"[^>]*/>\s*</intent-filter>', '', manifest, count=1, flags=re.S)
+          manifest_path.write_text(manifest)
+          website_only = {'JAVASCRIPT','DOM_STORAGE','BACK_BUTTON','PULL_TO_REFRESH','SWIPE_NAVIGATION','FILE_PICKER','SHARE','ORIENTATION','BATTERY','NETWORK_STATUS','DEVICE_INFO','DOWNLOADS','EXTERNAL_LINKS','FULLSCREEN','BIOMETRIC','SECURE_STORAGE','SCREEN_CAPTURE','PICTURE_IN_PICTURE'}
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+              summary.write('## Bubblewrap TWA build\n\n')
+              summary.write('Bubblewrap CLI: `1.25.0`\n\n')
+              summary.write('Selected features: '+(', '.join(sorted(selected)) if selected else 'none')+'\n\n')
+              summary.write('Generated Android permissions: '+(', '.join(permissions) if permissions else 'base INTERNET only')+'\n\n')
+              if os.environ.get('TWA_OUTPUT') == 'aab': summary.write('Digital Asset Links verification used the Play app-signing SHA-256 fingerprint. The upload-key fingerprint is not sufficient for a Play-distributed AAB.\n\n')
+              if 'DEEP_LINKS' in selected: summary.write(f'Bubblewrap verified HTTPS App Link intent filter retained for `{parsed.hostname}`.\n\n')
+              else: summary.write('HTTPS App Link intent filter was removed because DEEP_LINKS was not selected. Digital Asset Links is still required for verified TWA fullscreen.\n\n')
+              if selected & website_only:
+                  summary.write('Website/PWA implementation is still required for: '+', '.join(sorted(selected & website_only))+'. These are not native JavaScript bridges in a TWA.\n\n')
           PYCODE
-          echo "APP_ID=$APP_ID" >> "$GITHUB_ENV"
+
+          export BUBBLEWRAP_KEYSTORE_PASSWORD="$ANDROID_STORE_PASSWORD"
+          export BUBBLEWRAP_KEY_PASSWORD="$ANDROID_KEY_PASSWORD"
           cd twa-app
-          if [ "$TWA_OUTPUT" = aab ]; then gradle bundleRelease --no-daemon --stacktrace; else gradle assembleRelease --no-daemon --stacktrace; fi
+          if [ "$TWA_OUTPUT" = aab ]; then
+            bubblewrap build --manifest=twa-manifest.json --signingKeyPath=/tmp/wybuild-twa-signing.jks --signingKeyAlias="$ANDROID_KEY_ALIAS"
+            mkdir -p app/build/outputs/bundle/release
+            cp -f app-release-bundle.aab app/build/outputs/bundle/release/app-release-bundle.aab
+          else
+            bubblewrap build --manifest=twa-manifest.json --signingKeyPath=/tmp/wybuild-twa-signing.jks --signingKeyAlias="$ANDROID_KEY_ALIAS"
+            mkdir -p app/build/outputs/apk/release
+            cp -f app-release-signed.apk app/build/outputs/apk/release/app-release-signed.apk
+          fi
       - name: Sign and verify Android release artifacts
+        id: sign_artifacts
         if: inputs.build_mode == 'release' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto' || inputs.build_type == 'twa') && (inputs.build_type == 'twa' || steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')
         shell: bash
         env:
@@ -335,6 +490,7 @@ jobs:
           done < <(find . -type f -name '*.aab' -path '*/build/outputs/bundle/*' -print0)
 
       - name: Build Next.js static web export
+        id: build_next
         if: steps.detect.outputs.type == 'next' && (inputs.build_type == 'web' || inputs.build_type == 'auto')
         shell: bash
         run: |
@@ -344,29 +500,107 @@ jobs:
           if [ -d out ]; then cp -R out/. wybuild-output/; else echo '::error::This Next.js app did not produce a static out/ directory. For a standalone web artifact, configure output: export; for server-rendered apps, deploy it and build a TWA from its HTTPS URL.'; exit 1; fi
           test -f wybuild-output/index.html || { echo '::error::Next.js static export is missing index.html'; exit 1; }
       - name: Upload web output
+        id: upload_web
         if: inputs.build_type == 'web' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wybuild-web-${{ github.run_number }}
           path: 'wybuild-output/*'
           if-no-files-found: error
           retention-days: 7
       - name: Upload APK
+        id: upload_apk
         if: inputs.build_type == 'apk' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')) || (inputs.build_type == 'twa' && inputs.twa_output == 'apk')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wybuild-apk-${{ github.run_number }}
           path: '**/build/outputs/apk/**/*.apk'
           if-no-files-found: error
           retention-days: 7
       - name: Upload AAB
-        if: inputs.build_type == 'aab' || (inputs.build_type == 'twa' && inputs.twa_output == 'aab')
-        uses: actions/upload-artifact@v4
+        id: upload_aab
+        if: inputs.build_type == 'aab' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')) || (inputs.build_type == 'twa' && inputs.twa_output == 'aab')
+        uses: actions/upload-artifact@v7
         with:
           name: wybuild-aab-${{ github.run_number }}
           path: '**/build/outputs/bundle/**/*.aab'
           if-no-files-found: error
           retention-days: 7
+      - name: Explain build failure
+        if: failure()
+        shell: bash
+        env:
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          DETECT: ${{ steps.detect.outcome }}
+          TARGET: ${{ steps.validate_target.outcome }}
+          SIGNING: ${{ steps.validate_signing.outcome }}
+          JAVA_NATIVE: ${{ steps.setup_java_native.outcome }}
+          JAVA_WEB: ${{ steps.setup_java_web.outcome }}
+          FLUTTER_SETUP: ${{ steps.setup_flutter.outcome }}
+          FLUTTER_BUILD: ${{ steps.build_flutter.outcome }}
+          GRADLE_BUILD: ${{ steps.build_gradle.outcome }}
+          NODE_SETUP: ${{ steps.setup_node.outcome }}
+          NODE_DEPS: ${{ steps.install_node_deps.outcome }}
+          WEB_BUILD: ${{ steps.build_web.outcome }}
+          JAVA_TWA: ${{ steps.setup_java_twa.outcome }}
+          NODE_TWA: ${{ steps.setup_node_twa.outcome }}
+          SDK_TWA: ${{ steps.setup_sdk_twa.outcome }}
+          INSTALL_SDK_TWA: ${{ steps.install_sdk_twa.outcome }}
+          BUBBLEWRAP_INSTALL: ${{ steps.install_bubblewrap.outcome }}
+          TWA_BUILD: ${{ steps.build_twa.outcome }}
+          SIGN_ARTIFACTS: ${{ steps.sign_artifacts.outcome }}
+          NEXT_BUILD: ${{ steps.build_next.outcome }}
+          UPLOAD_WEB: ${{ steps.upload_web.outcome }}
+          UPLOAD_APK: ${{ steps.upload_apk.outcome }}
+          UPLOAD_AAB: ${{ steps.upload_aab.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          {
+            echo '## WyBuild failure diagnosis'
+            echo ''
+            echo "The workflow failed. The first failed step below identifies where it stopped; open its expanded log for the exact compiler, Gradle, npm, SDK, signing, or GitHub error text."
+            echo ''
+            echo "Run logs: $RUN_URL"
+            echo ''
+            failed=0
+            report() {
+              local name="$1" outcome="$2" hint="$3"
+              if [ "$outcome" = failure ]; then
+                failed=1
+                echo "- **Failed step: $name**"
+                echo "  - Likely area: $hint"
+              fi
+            }
+            report 'Checkout' "$CHECKOUT" 'GitHub could not fetch the repository/ref; check repository access and the selected branch.'
+            report 'Detect project type' "$DETECT" 'Repository inspection failed; check GitHub API/repository contents and whether the repository is empty.'
+            report 'Validate requested target' "$TARGET" 'The selected output does not match the detected project type; choose a compatible build target.'
+            report 'Validate Play release signing prerequisites' "$SIGNING" 'A required persistent upload-keystore secret is missing; add all four ANDROID_* secrets.'
+            report 'Set up Java (native Android project)' "$JAVA_NATIVE" 'JDK 17 setup or runner download failed; inspect network/setup-java log details.'
+            report 'Set up Java (web wrapper)' "$JAVA_WEB" 'JDK 17 setup failed; inspect setup-java log details.'
+            report 'Set up Flutter' "$FLUTTER_SETUP" 'Flutter SDK setup failed; inspect the requested Flutter channel/version and runner network.'
+            report 'Build Flutter Android' "$FLUTTER_BUILD" 'pub get or Flutter compilation failed; the step log contains the package-resolution/compiler diagnostic.'
+            report 'Build existing Gradle Android project' "$GRADLE_BUILD" 'Gradle compilation/configuration failed; inspect the first Caused by/What went wrong block and verify Gradle/JDK/plugin compatibility.'
+            report 'Set up Node.js' "$NODE_SETUP" 'Node.js setup failed; inspect setup-node and cache configuration.'
+            report 'Install Node dependencies' "$NODE_DEPS" 'Lockfile/dependency installation failed; commit the correct lockfile and verify package-manager versions and registry access.'
+            report 'Build static web output' "$WEB_BUILD" 'Frontend build failed or no supported dist/build/out/index.html output was produced.'
+            report 'Set up Java for TWA' "$JAVA_TWA" 'JDK 17 setup failed before the TWA build.'
+            report 'Set up Node.js for Bubblewrap TWA' "$NODE_TWA" 'Node.js setup failed before Bubblewrap could run.'
+            report 'Set up Android SDK for TWA' "$SDK_TWA" 'ANDROID_HOME/sdkmanager could not be initialized on the runner.'
+            report 'Install Android 16 SDK for TWA' "$INSTALL_SDK_TWA" 'Android platform 36/build-tools 36.0.0 could not be downloaded or installed.'
+            report 'Install Bubblewrap CLI' "$BUBBLEWRAP_INSTALL" 'The pinned Bubblewrap CLI could not be installed. Check npm registry/network access.'
+            report 'Validate and build TWA with Bubblewrap' "$TWA_BUILD" 'Check HTTPS reachability, PWA manifest/icon, package ID, persistent signing key, Digital Asset Links fingerprint, Bubblewrap validation, or Android compilation output.'
+            report 'Sign and verify Android release artifacts' "$SIGN_ARTIFACTS" 'Signing credentials, existing certificate, APK signature, or AAB signature did not match.'
+            report 'Build Next.js static web export' "$NEXT_BUILD" 'Next.js build failed or output: export did not create out/index.html; server-only features need a deployed backend.'
+            report 'Upload web output' "$UPLOAD_WEB" 'No web artifact matched the upload path; inspect the static output directory.'
+            report 'Upload APK' "$UPLOAD_APK" 'No APK was generated at build/outputs/apk/**/*.apk; inspect the preceding build step.'
+            report 'Upload AAB' "$UPLOAD_AAB" 'No AAB was generated at build/outputs/bundle/**/*.aab; inspect the preceding build/signing step.'
+            if [ "$failed" = 0 ]; then
+              echo '- The failure occurred in an action step without a dedicated outcome marker (for example, checkout/action infrastructure). Open the run logs above and inspect the first red step.'
+            fi
+            echo ''
+            echo '> WyBuild reports the failing step and a targeted troubleshooting direction here. The complete raw error and stack trace remain in the linked GitHub step log.'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Notify WyBuild about build result (FCM)
         if: always()
         shell: bash
