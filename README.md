@@ -32,6 +32,12 @@ Builds still run in the connected repository's GitHub Actions environment, so Gi
 
 Subscription state is stored server-side in Firebase/Firestore. Checkout is provider-agnostic: set `WYBUILD_PRO_MONTHLY_URL`, `WYBUILD_PRO_YEARLY_URL` (optionally containing `{USER_ID}`) and a `BILLING_WEBHOOK_SECRET`; your payment provider should call `POST /api/billing/webhook` with the signed user/plan/status payload.
 
+## Vercel deployment and Flutter root detection
+
+Vercel runs `bash vercel-build.sh`. The script resolves its own directory, locates the Flutter app by checking for both `pubspec.yaml` and `lib/main.dart`, and supports a Flutter app nested in common subdirectories. It reports the discovered app directory and gives an actionable error if the source files are absent. The generated web output is placed in the repository-root `build/web` directory configured in `vercel.json`.
+
+If deployment still reports that `lib/main.dart` is missing, confirm that the file is committed to the connected GitHub branch and that Vercel is deploying the intended repository and branch. Do not create a placeholder entrypoint just to bypass the error.
+
 ## Local Flutter Web development
 
 ```bash
