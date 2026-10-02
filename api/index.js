@@ -1,0 +1,1356 @@
+import crypto from 'node:crypto';
+import { kv } from '@vercel/kv';
+import AdmZip from 'adm-zip';
+import sodium from 'libsodium-wrappers';
+
+const COOKIE = 'wybuild_session';
+const STATE_COOKIE = 'wybuild_oauth_state';
+const GH = 'https://api.github.com';
+const SESSION_DAYS = 7;
+const MAX_REPO_PAGES = 20;
+const MAX_BRANCH_PAGES = 20;
+const MAX_RUN_PAGES = 10;
+const MAX_RELEASE_PAGES = 10;
+const DEFAULT_FREE_LIMIT = 5; // Free beta guardrail; no paid plans are enabled.
+const activeBuildLocks = new Map();
+
+// A GitHub Actions run can get stuck reporting status=in_progress and never
+// transition to completed (a lost runner, a GitHub-side hiccup, a job killed
+// out-of-band). Without a cutoff, a single stuck run would reserve a quota
+// slot forever and could make a plan look "full" even with zero successful
+// builds. Anything still in_progress after this many hours is treated as
+// abandoned and excluded from the reserved-slot count.
+const STALE_ACTIVE_HOURS = 3;
+
+// How many builds a plan may have in flight (queued/in_progress) at once,
+// independent of the monthly successful-build quota. Paid plans can run
+// several builds in parallel instead of waiting for one to finish.
+const PLAN_CONCURRENCY = { FREE: 1, PRO: 5, 'PRO+': 15, PROPLUS: 15 };
+
+// The Builds page is a history list, not an audit log - a build that failed
+// (bad gradlew, bad project structure, etc) has no ongoing value once it's
+// old. Auto-hide (never delete on GitHub) failed runs past this age so the
+// page doesn't grow unbounded with stale failures.
+const FAILED_RUN_HIDE_DAYS = 5;
+
+// Both the Dashboard and Builds page call GET /api/github/runs for every
+// repo the user can see, every time either page loads. Cache each
+// owner/repo's run list briefly in KV so navigating between the two (or
+// re-opening Builds) doesn't re-walk GitHub's pagination from scratch.
+const RUNS_CACHE_TTL_SECONDS = 20;
+const FREE_NATIVE_FEATURES = ['INTERNET', 'JAVASCRIPT', 'DOM_STORAGE', 'BACK_BUTTON', 'FILE_PICKER', 'SHARE', 'VIBRATION', 'ORIENTATION', 'BATTERY', 'NETWORK_STATUS', 'DEVICE_INFO', 'LOCAL_NOTIFICATIONS'];
+const PRO_NATIVE_FEATURES = ['CAMERA_MIC', 'LOCATION', 'DOWNLOADS', 'EXTERNAL_LINKS', 'FULLSCREEN', 'BIOMETRIC', 'SECURE_STORAGE', 'SCREEN_CAPTURE', 'PICTURE_IN_PICTURE', 'DEEP_LINKS']; // Kept for backwards compatibility during free beta.
+const ALL_NATIVE_FEATURES = [...FREE_NATIVE_FEATURES, ...PRO_NATIVE_FEATURES];
+
+function normalizeNativeFeatures(value, plan) {
+  const p = String(plan || 'FREE').toUpperCase();
+  const requested = typeof value === 'string'
+    ? value.split(',').map(x => x.trim().toUpperCase()).filter(Boolean)
+    : [];
+  const base = [...FREE_NATIVE_FEATURES];
+  const allowedPremium = [...PRO_NATIVE_FEATURES]; // All native feature flags are unlocked during the free beta.
+  const selected = [...new Set([...base, ...requested])]
+    .filter(x => ALL_NATIVE_FEATURES.includes(x) && (FREE_NATIVE_FEATURES.includes(x) || allowedPremium.includes(x)));
+  return selected;
+}
+
+const json = (res, status, body) => {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify(body));
+};
+
+const urlOf = req => new URL(req.url, `http://${req.headers.host}`);
+
+async function body(req) {
+  let s = '';
+  for await (const c of req) s += c;
+  if (!s) return {};
+  try { return JSON.parse(s); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+}
+
+function key() {
+  return crypto.createHash('sha256')
+    .update(process.env.SESSION_SECRET || 'development-only-change-me')
+    .digest();
+}
+
+function seal(obj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key(), iv);
+  const raw = Buffer.from(JSON.stringify({ ...obj, exp: Date.now() + SESSION_DAYS * 86400000 }));
+  const enc = Buffer.concat([cipher.update(raw), cipher.final()]);
+  return [iv, cipher.getAuthTag(), enc].map(x => x.toString('base64url')).join('.');
+}
+
+function unseal(v) {
+  try {
+    const [a, b, c] = v.split('.');
+    if (!a || !b || !c) return null;
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key(), Buffer.from(a, 'base64url'));
+    decipher.setAuthTag(Buffer.from(b, 'base64url'));
+    const x = JSON.parse(Buffer.concat([
+      decipher.update(Buffer.from(c, 'base64url')),
+      decipher.final()
+    ]));
+    return x.exp > Date.now() ? x : null;
+  } catch {
+    return null;
+  }
+}
+
+function cookies(req) {
+  return Object.fromEntries(
+    (req.headers.cookie || '')
+      .split(';')
+      .filter(Boolean)
+      .map(x => {
+        const i = x.indexOf('=');
+        return [i < 0 ? x.trim() : x.slice(0, i).trim(), decodeURIComponent(i < 0 ? '' : x.slice(i + 1))];
+      })
+  );
+}
+
+function session(req) {
+  const v = cookies(req)[COOKIE];
+  return v ? unseal(v) : null;
+}
+
+function setCookie(res, name, value, maxAge = 604800) {
+  const cookie = `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+  const existing = res.getHeader('Set-Cookie');
+  const values = existing ? (Array.isArray(existing) ? existing : [existing]) : [];
+  res.setHeader('Set-Cookie', [...values, cookie]);
+}
+
+function clearCookie(res, name) {
+  setCookie(res, name, '', 0);
+}
+
+async function gh(path, token, options = {}) {
+  const r = await fetch(GH + path, {
+    ...options,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      Authorization: `Bearer ${token}`,
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await r.text();
+  let data = {};
+  try { data = JSON.parse(text); }
+  catch { data = { message: text }; }
+
+  if (!r.ok) {
+    const error = Object.assign(
+      new Error(data.message || `GitHub request failed (${r.status})`),
+      { status: r.status, data }
+    );
+    if (r.headers.get('x-ratelimit-remaining') === '0') error.rateLimited = true;
+    throw error;
+  }
+  return data;
+}
+
+function withPage(path, page, perPage = 100) {
+  const u = new URL(path, 'https://wybuild.internal');
+  u.searchParams.set('per_page', String(perPage));
+  u.searchParams.set('page', String(page));
+  return `${u.pathname}${u.search}`;
+}
+
+async function ghList(path, token, { keyName = null, maxPages = 10, perPage = 100 } = {}) {
+  const out = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const data = await gh(withPage(path, page, perPage), token);
+    const items = keyName ? (Array.isArray(data?.[keyName]) ? data[keyName] : []) : (Array.isArray(data) ? data : []);
+    out.push(...items);
+    if (items.length < perPage) break;
+  }
+  return out;
+}
+
+const configured = () => !!(
+  process.env.GITHUB_CLIENT_ID &&
+  process.env.GITHUB_CLIENT_SECRET &&
+  process.env.SESSION_SECRET
+);
+
+function callback(req) {
+  const u = urlOf(req);
+  const base = (process.env.APP_URL || `${u.protocol}//${u.host}`).replace(/\/$/, '');
+  return `${base}/api/auth/github/callback`;
+}
+
+function appBase(req) {
+  const u = urlOf(req);
+  return (process.env.APP_URL || `${u.protocol}//${u.host}`).replace(/\/$/, '');
+}
+
+function requireSession(req, res) {
+  const s = session(req);
+  if (!s) {
+    json(res, 401, { error: 'GitHub connection required', code: 'AUTH_REQUIRED' });
+    return null;
+  }
+  return s;
+}
+
+function safePart(value, label) {
+  if (typeof value !== 'string' || !value || value.length > 200) {
+    throw Object.assign(new Error(`${label} is invalid`), { status: 400 });
+  }
+  return value;
+}
+
+// Reads the WyBuild workflow file as installed on a given ref, or null if
+// it isn't there. Used to sanity-check a dispatch's inputs against what the
+// installed workflow actually declares - see github/rebuild below, which
+// hit "Unexpected inputs provided" from GitHub whenever a repo was still
+// running a workflow version installed before `native_features` existed.
+async function fetchWorkflowContent(owner, repo, ref, token) {
+  try {
+    const file = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, token);
+    return Buffer.from(file.content || '', 'base64').toString('utf8');
+  } catch (e) {
+    if (e.status === 404) return null;
+    throw e;
+  }
+}
+
+// The workflow's own "Detect project type" step finds gradlew anywhere in
+// the repo (`find . -name gradlew`), but Project Doctor was only checking
+// the repo root via the contents API - a Gradle project with gradlew in a
+// subdirectory was misdiagnosed as "unknown" even though the real build
+// would find it fine. A recursive git tree listing matches the workflow's
+// search in a single call, and replaces what was already a same-cost
+// root-only contents lookup, so this isn't a slowdown.
+async function findGradlewAnywhere(owner, repo, ref, token) {
+  let tree;
+  try {
+    tree = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(ref)}?recursive=1`, token);
+  } catch (e) {
+    if (e.status === 404) return false; // empty repo or bad ref
+    throw e;
+  }
+  if (tree.truncated) {
+    // Repo too large to list in one call (rare). Fall back to a root-only
+    // check rather than silently reporting "no gradlew" for a huge repo.
+    try {
+      await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/gradlew?ref=${encodeURIComponent(ref)}`, token);
+      return true;
+    } catch (e) {
+      if (e.status === 404) return false;
+      throw e;
+    }
+  }
+  return (tree.tree || []).some(entry =>
+    entry.type === 'blob' &&
+    entry.path.split('/').pop() === 'gradlew' &&
+    !entry.path.startsWith('.git/') &&
+    !entry.path.includes('/node_modules/') &&
+    !entry.path.startsWith('node_modules/')
+  );
+}
+
+async function wydevEntitlement(s) {
+  // Free beta: deliberately do not call any external billing service.
+  // Keep a modest monthly limit and one active build to protect shared service resources.
+  return { configured: false, plan: 'FREE', buildLimit: DEFAULT_FREE_LIMIT, beta: true, billingUrl: null };
+}
+
+function monthStartISO() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+async function countMonthlyBuilds(s) {
+  const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
+    maxPages: MAX_REPO_PAGES,
+    perPage: 100
+  });
+  if (!Array.isArray(repos)) {
+    throw Object.assign(new Error('GitHub returned an invalid repository list.'), { status: 502 });
+  }
+
+  const created = encodeURIComponent(`>=${monthStartISO()}`);
+  let successful = 0;
+  let active = 0;
+
+  // Query successful and active runs separately. This is both more accurate
+  // and cheaper than paging through every failed/cancelled run. A failed build
+  // never consumes quota; an active build temporarily reserves a slot, unless
+  // it has been in_progress past STALE_ACTIVE_HOURS (see constant above).
+  //
+  // Fail closed if GitHub cannot inspect a repository. Treating an API error
+  // as zero builds could undercount usage and allow a monthly quota bypass.
+  for (let i = 0; i < repos.length; i += 5) {
+    const chunk = repos.slice(i, i + 5);
+    const results = await Promise.all(chunk.map(async repo => {
+      if (!repo?.owner?.login || !repo?.name) {
+        throw Object.assign(new Error('GitHub returned an invalid repository record.'), { status: 502 });
+      }
+
+      const base = `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/actions/runs`;
+      const [successRuns, activeRuns] = await Promise.all([
+        ghList(`${base}?created=${created}&conclusion=success`, s.token, {
+          keyName: 'workflow_runs', maxPages: 1, perPage: 100
+        }),
+        ghList(`${base}?created=${created}&status=in_progress`, s.token, {
+          keyName: 'workflow_runs', maxPages: 1, perPage: 100
+        })
+      ]);
+
+      const staleCutoff = Date.now() - STALE_ACTIVE_HOURS * 3600000;
+      return {
+        successful: successRuns.filter(run => run.name === 'WyBuild').length,
+        active: activeRuns.filter(run => run.name === 'WyBuild' && new Date(run.created_at).getTime() > staleCutoff).length
+      };
+    }));
+
+    for (const result of results) {
+      successful += result.successful;
+      active += result.active;
+    }
+  }
+
+  const ledgerSuccessful = await countLedgerThisMonth(s);
+  return { successful: successful + ledgerSuccessful, active, reserved: successful + ledgerSuccessful + active };
+}
+
+// --- Deleted-run quota ledger --------------------------------------------
+// Deleting a run from GitHub normally makes it vanish from countMonthlyBuilds,
+// which would let anyone bypass their monthly quota by deleting successful
+// runs. To keep deleted successful runs counted, each deletion increments a
+// per-user, per-month counter in Vercel KV, keyed to the month the run was
+// originally created in (not the month it was deleted), so it lines up with
+// countMonthlyBuilds' own `created` filtering.
+// --- github/runs cache -----------------------------------------------------
+function runsCacheKey(login, owner, repo, created) {
+  return `wybuild:runs:${login}:${owner}/${repo}:${created || 'all'}`;
+}
+
+// Best-effort invalidation after anything that changes a repo's run list
+// (a new dispatch, a rerun, a delete), so the Builds page reflects the
+// change immediately instead of waiting out the short cache TTL. The
+// frontend never sends a `created` filter today, so clearing the 'all'
+// entry covers every real caller; a KV failure here just means the next
+// read is briefly stale, so it's swallowed rather than propagated.
+async function invalidateRunsCache(login, owner, repo) {
+  try { await kv.del(runsCacheKey(login, owner, repo, null)); } catch { /* best-effort */ }
+}
+
+function ledgerKey(login, date) {
+  const d = new Date(date);
+  const monthKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  return `wybuild:ledger:${login}:${monthKey}`;
+}
+
+// Called BEFORE the GitHub delete call - if the KV write succeeds but the
+// delete itself then fails, the run is briefly over-counted rather than
+// under-counted, matching this codebase's existing fail-closed stance on
+// quota accuracy (see countMonthlyBuilds). Errors propagate so a KV outage
+// blocks the delete rather than silently letting quota go uncounted.
+async function recordDeletedRun(s, { createdAt }) {
+  const key = ledgerKey(s.user.login, createdAt);
+  await kv.incr(key);
+  await kv.expire(key, 60 * 24 * 3600); // ~60 days - covers the month plus buffer
+}
+
+async function countLedgerThisMonth(s) {
+  const key = ledgerKey(s.user.login, new Date());
+  const val = await kv.get(key);
+  return Number(val) || 0;
+}
+
+
+// Bump this whenever WORKFLOW's content changes materially (action versions,
+// validation logic, build steps, etc). It's embedded as a YAML comment in the
+// installed file so /api/github/workflow can tell an already-installed repo
+// apart from one running an older generation of the template.
+const WORKFLOW_VERSION = 30;
+
+const WORKFLOW = "# wybuild-workflow-version: 30\nname: WyBuild\non:\n  workflow_dispatch:\n    inputs:\n      build_type:\n        description: Build target\n        required: true\n        type: choice\n        options: [auto, apk, aab, web, twa]\n        default: auto\n      build_mode:\n        description: Build mode\n        required: true\n        type: choice\n        options: [debug, release]\n        default: release\n      native_features:\n        description: Native Web-to-App features (server-authorized)\n        required: false\n        type: string\n        default: free\n      web_app_url:\n        description: Deployed HTTPS PWA URL for TWA builds\n        required: false\n        type: string\n        default: ''\n      app_id:\n        description: Android package ID for TWA builds\n        required: false\n        type: string\n        default: com.example.myapp\n      app_name:\n        description: Android app display name\n        required: false\n        type: string\n        default: My App\n      twa_output:\n        description: TWA artifact format\n        required: false\n        type: choice\n        options: [apk, aab]\n        default: apk\nrun-name: \"WyBuild: ${{ inputs.build_type }} (${{ inputs.build_mode }}) [${{ inputs.native_features }}] on ${{ github.ref_name }}\"\npermissions:\n  contents: read\nconcurrency:\n  group: wybuild-${{ github.repository }}-${{ github.ref }}-${{ inputs.build_type }}-${{ inputs.build_mode }}\n  cancel-in-progress: false\njobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 60\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v4\n      - name: Detect project type\n        id: detect\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ -f pubspec.yaml ]; then type=flutter\n          elif find . -type f -name gradlew -not -path './.git/*' -not -path '*/node_modules/*' | grep -q .; then type=gradle\n          elif [ -f package.json ]; then\n            if node -e \"const p=require('./package.json'); process.exit(p.dependencies?.next || p.devDependencies?.next ? 0 : 1)\"; then type=next; else type=node-web; fi\n          elif find . -maxdepth 3 -type f \\( -name index.html -o -name '*.html' \\) -not -path './.git/*' | grep -q .; then type=vanilla\n          else type=unknown; fi\n          echo \"type=$type\" >> \"$GITHUB_OUTPUT\"\n      - name: Validate requested target\n        shell: bash\n        env:\n          REQUESTED: ${{ inputs.build_type }}\n          DETECTED: ${{ steps.detect.outputs.type }}\n        run: |\n          set -euo pipefail\n          if [ \"$REQUESTED\" = twa ]; then exit 0; fi\n          if [ \"$DETECTED\" = unknown ]; then echo '::error::Unsupported project'; exit 1; fi\n          if { [ \"$DETECTED\" = node-web ] || [ \"$DETECTED\" = vanilla ] || [ \"$DETECTED\" = next ]; } && { [ \"$REQUESTED\" = apk ] || [ \"$REQUESTED\" = aab ]; }; then echo '::error::Web projects are never packaged in a WebView. Deploy your PWA over HTTPS and select the TWA target.'; exit 1; fi\n          if [ \"$REQUESTED\" = web ] && { [ \"$DETECTED\" = flutter ] || [ \"$DETECTED\" = gradle ]; }; then echo '::error::Web target unavailable for native project'; exit 1; fi\n          if [ \"$DETECTED\" = next ] && [ \"$REQUESTED\" != web ] && [ \"$REQUESTED\" != auto ]; then echo '::error::Next.js requires static export for APK/AAB'; exit 1; fi\n      - name: Validate Play release signing prerequisites\n        if: inputs.build_mode == 'release' && (inputs.build_type == 'aab' || (inputs.build_type == 'twa' && inputs.twa_output == 'aab'))\n        shell: bash\n        env:\n          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}\n          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}\n        run: |\n          set -euo pipefail\n          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_STORE_PASSWORD; do\n            if [ -z \"${!name:-}\" ]; then\n              echo \"::error::A Play-ready AAB requires a persistent upload keystore. Configure all four repository Actions secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD and ANDROID_STORE_PASSWORD. Temporary keys are not used for AAB releases.\"\n              exit 1\n            fi\n          done\n\n      - name: Set up Java (native Android project)\n        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle'\n        uses: actions/setup-java@v4\n        with:\n          distribution: temurin\n          java-version: '17'\n          cache: gradle\n      - name: Set up Java (web wrapper)\n        if: steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'\n        uses: actions/setup-java@v4\n        with:\n          distribution: temurin\n          java-version: '17'\n      - name: Set up Flutter\n        if: steps.detect.outputs.type == 'flutter'\n        uses: subosito/flutter-action@v2.23.0\n        with:\n          channel: stable\n          cache: true\n      - name: Build Flutter Android\n        if: steps.detect.outputs.type == 'flutter' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto')\n        shell: bash\n        run: |\n          set -euo pipefail\n          flutter pub get\n          if [ '${{ inputs.build_type }}' = aab ]; then flutter build appbundle --release\n          elif [ '${{ inputs.build_type }}' = apk ] && [ '${{ inputs.build_mode }}' = debug ]; then flutter build apk --debug\n          else flutter build apk --release; fi\n      - name: Build existing Gradle Android project\n        if: steps.detect.outputs.type == 'gradle' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto')\n        shell: bash\n        run: |\n          set -euo pipefail\n          wrapper=\"$(find . -type f -name gradlew -not -path './.git/*' -not -path '*/node_modules/*' | head -n 1)\"\n          cd \"$(dirname \"$wrapper\")\"; chmod +x ./gradlew\n          if [ '${{ inputs.build_type }}' = aab ]; then ./gradlew bundleRelease --no-daemon --stacktrace\n          elif [ '${{ inputs.build_type }}' = apk ] && [ '${{ inputs.build_mode }}' = debug ]; then ./gradlew assembleDebug --no-daemon --stacktrace\n          else ./gradlew assembleRelease --no-daemon --stacktrace; fi\n      - name: Set up Node.js\n        if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'\n        uses: actions/setup-node@v4\n        with:\n          node-version: 22\n          cache: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' && 'npm' || '' }}\n      - name: Install Node dependencies\n        if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'\n        shell: bash\n        run: |\n          set -euo pipefail\n          if [ -f package-lock.json ]; then npm ci; elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile; elif [ -f yarn.lock ]; then corepack enable && yarn install --immutable; else npm install; fi\n      - name: Build static web output\n        if: (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla') && (inputs.build_type == 'web' || inputs.build_type == 'auto')\n        shell: bash\n        run: |\n          set -euo pipefail\n          mkdir -p wybuild-output\n          if [ '${{ steps.detect.outputs.type }}' = node-web ] && node -e \"const p=require('./package.json'); process.exit(typeof p.scripts?.build === 'string' ? 0 : 1)\"; then npm run build; fi\n          if [ -d dist ]; then cp -R dist/. wybuild-output/\n          elif [ -d build ]; then cp -R build/. wybuild-output/\n          elif [ -d out ]; then cp -R out/. wybuild-output/\n          elif [ -f index.html ]; then rsync -a --exclude node_modules --exclude .git --exclude wybuild-output ./ wybuild-output/\n          elif [ -f web/index.html ]; then rsync -a --exclude node_modules --exclude .git --exclude wybuild-output web/ wybuild-output/\n          else echo '::error::No static output found'; exit 1; fi\n          test -f wybuild-output/index.html || { echo '::error::Static output has no index.html'; exit 1; }\n      - name: Set up Java for TWA\n        if: inputs.build_type == 'twa'\n        uses: actions/setup-java@v4\n        with:\n          distribution: temurin\n          java-version: '17'\n      - name: Set up Gradle for TWA\n        if: inputs.build_type == 'twa'\n        uses: gradle/actions/setup-gradle@v4\n        with:\n          gradle-version: '8.11.1'\n      - name: Set up Android SDK for TWA\n        if: inputs.build_type == 'twa'\n        uses: android-actions/setup-android@v3\n      - name: Install Android 16 SDK for TWA\n        if: inputs.build_type == 'twa'\n        shell: bash\n        run: sdkmanager --install \"platforms;android-36\" \"build-tools;36.0.0\"\n      - name: Validate TWA prerequisites and build TWA\n        if: inputs.build_type == 'twa'\n        shell: bash\n        env:\n          WEB_APP_URL: ${{ inputs.web_app_url }}\n          APP_ID: ${{ inputs.app_id }}\n          APP_NAME: ${{ inputs.app_name }}\n          TWA_OUTPUT: ${{ inputs.twa_output }}\n          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}\n          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}\n        run: |\n          set -euo pipefail\n          python3 - <<'PYCODE'\n          import os, re, urllib.request, json\n          from urllib.parse import urlparse\n          url=os.environ.get('WEB_APP_URL','').strip().rstrip('/')\n          app_id=os.environ.get('APP_ID','').strip()\n          parsed_url=urlparse(url)\n          origin=f'{parsed_url.scheme}://{parsed_url.netloc}'\n          if not url.startswith('https://'): raise SystemExit('::error::TWA requires a deployed HTTPS website URL.')\n          app_name=os.environ.get('APP_NAME','').strip()\n          if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+', app_id): raise SystemExit('::error::Invalid Android package ID.')\n          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}', app_name): raise SystemExit('::error::App name must be 1-40 letters, numbers, spaces, dots, underscores or hyphens.')\n          manifest=None\n          for path in ['/manifest.json','/manifest.webmanifest']:\n              try:\n                  with urllib.request.urlopen(url+path, timeout=15) as r: manifest=json.loads(r.read().decode())\n                  break\n              except Exception: pass\n          if not isinstance(manifest, dict): raise SystemExit('::error::Could not load a valid manifest.json or manifest.webmanifest at the website root.')\n          if not all(os.environ.get(k) for k in ['ANDROID_KEYSTORE_BASE64','ANDROID_KEY_ALIAS','ANDROID_KEY_PASSWORD','ANDROID_STORE_PASSWORD']):\n              raise SystemExit('::error::TWA requires a persistent signing keystore. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD and ANDROID_STORE_PASSWORD to repository Actions secrets.')\n          import subprocess\n          keystore='/tmp/wybuild-twa-signing.jks'\n          with open(keystore,'wb') as f: f.write(__import__('base64').b64decode(os.environ['ANDROID_KEYSTORE_BASE64']))\n          cert=subprocess.run(['keytool','-list','-v','-keystore',keystore,'-storepass',os.environ['ANDROID_STORE_PASSWORD'],'-alias',os.environ['ANDROID_KEY_ALIAS']],capture_output=True,text=True)\n          if cert.returncode: raise SystemExit('::error::Could not read the configured signing certificate. Check the keystore, alias and store password.')\n          match=re.search(r'SHA256:\\s*([0-9A-Fa-f:]{32,})',cert.stdout)\n          if not match: raise SystemExit('::error::Could not extract the signing certificate SHA-256 fingerprint.')\n          fingerprint=match.group(1).upper()\n          try:\n              with urllib.request.urlopen(origin+'/.well-known/assetlinks.json', timeout=15) as r: links=json.loads(r.read().decode())\n          except Exception: raise SystemExit('::error::Publish /.well-known/assetlinks.json with your package ID and signing certificate SHA-256 fingerprint before building a verified TWA.')\n          verified=any(item.get('target',{}).get('namespace')=='android_app' and item.get('target',{}).get('package_name')==app_id and 'delegate_permission/common.handle_all_urls' in item.get('relation',[]) and fingerprint in [str(x).upper() for x in item.get('target',{}).get('sha256_cert_fingerprints',[])] for item in links if isinstance(item,dict)) if isinstance(links,list) else False\n          if not verified: raise SystemExit('::error::Digital Asset Links does not match this package ID and signing certificate fingerprint. Update assetlinks.json, then rebuild.')\n          print('PWA manifest, persistent signing key and Digital Asset Links verified.')\n          PYCODE\n          mkdir -p twa-app/app/src/main/java/com/wybuild/twa twa-app/app/src/main/res/values\n          cat > twa-app/settings.gradle <<'EOF'\n          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\n          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\n          rootProject.name = \"WyBuildTwa\"\n          include(\":app\")\n          EOF\n          cat > twa-app/build.gradle <<'EOF'\n          plugins { id 'com.android.application' version '8.9.1' apply false }\n          EOF\n          cat > twa-app/gradle.properties <<'EOF'\n          android.useAndroidX=true\n          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n          EOF\n          cat > twa-app/app/build.gradle <<'EOF'\n          plugins { id 'com.android.application' }\n          android { namespace 'com.wybuild.twa'; compileSdk 36; defaultConfig { applicationId System.getenv('APP_ID'); minSdk 23; targetSdk 36; versionCode (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger(); versionName '1.0.0' } }\n          dependencies { implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0' }\n          EOF\n          cat > twa-app/app/src/main/AndroidManifest.xml <<'EOF'\n          <manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n            <uses-permission android:name=\"android.permission.INTERNET\" />\n            <application android:label=\"__APP_NAME__\" android:theme=\"@android:style/Theme.Material.Light.NoActionBar\" android:usesCleartextTraffic=\"false\">\n              <meta-data android:name=\"asset_statements\" android:resource=\"@string/asset_statements\" />\n              <activity android:name=\"com.google.androidbrowserhelper.trusted.LauncherActivity\" android:exported=\"true\" android:label=\"__APP_NAME__\">\n                <meta-data android:name=\"android.support.customtabs.trusted.DEFAULT_URL\" android:value=\"__WEB_APP_URL__\" />\n                <meta-data android:name=\"android.support.customtabs.trusted.STATUS_BAR_COLOR\" android:resource=\"@color/colorPrimary\" />\n                <meta-data android:name=\"android.support.customtabs.trusted.NAVIGATION_BAR_COLOR\" android:resource=\"@color/navigationColor\" />\n                <intent-filter><action android:name=\"android.intent.action.MAIN\" /><category android:name=\"android.intent.category.LAUNCHER\" /></intent-filter>\n              </activity>\n            </application>\n          </manifest>\n          EOF\n          cat > twa-app/app/src/main/res/values/colors.xml <<'EOF'\n          <resources>\n            <color name=\"colorPrimary\">#111827</color>\n            <color name=\"navigationColor\">#111827</color>\n          </resources>\n          EOF\n          cat > twa-app/app/src/main/res/values/strings.xml <<'EOF'\n          <resources>\n            <string name=\"asset_statements\" translatable=\"false\">[{&quot;include&quot;: &quot;__WEB_ORIGIN__/.well-known/assetlinks.json&quot;}]</string>\n          </resources>\n          EOF\n          python3 - <<'PYCODE'\n          import os, pathlib\n          root=pathlib.Path('twa-app')\n          for p in root.rglob('*'):\n              if p.is_file():\n                  t=p.read_text()\n                  t=t.replace('__APP_NAME__',os.environ['APP_NAME'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'))\n                  t=t.replace('__WEB_APP_URL__',os.environ['WEB_APP_URL'].rstrip('/'))\n                  from urllib.parse import urlparse\n                  parsed=urlparse(os.environ['WEB_APP_URL'])\n                  t=t.replace('__WEB_ORIGIN__', f'{parsed.scheme}://{parsed.netloc}')\n                  p.write_text(t)\n          PYCODE\n          echo \"APP_ID=$APP_ID\" >> \"$GITHUB_ENV\"\n          cd twa-app\n          if [ \"$TWA_OUTPUT\" = aab ]; then gradle bundleRelease --no-daemon --stacktrace; else gradle assembleRelease --no-daemon --stacktrace; fi\n      - name: Sign and verify Android release artifacts\n        if: inputs.build_mode == 'release' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto' || inputs.build_type == 'twa') && (inputs.build_type == 'twa' || steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')\n        shell: bash\n        env:\n          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}\n          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}\n        run: |\n          set -euo pipefail\n          KEYSTORE=/tmp/wybuild-release.jks\n          PERSISTENT=false\n          if [ -n \"${ANDROID_KEYSTORE_BASE64:-}\" ] && [ -n \"${ANDROID_KEY_ALIAS:-}\" ] && [ -n \"${ANDROID_KEY_PASSWORD:-}\" ] && [ -n \"${ANDROID_STORE_PASSWORD:-}\" ]; then\n            printf '%s' \"$ANDROID_KEYSTORE_BASE64\" | base64 --decode > \"$KEYSTORE\"\n            ALIAS=\"$ANDROID_KEY_ALIAS\"; KP=\"$ANDROID_KEY_PASSWORD\"; SP=\"$ANDROID_STORE_PASSWORD\"; PERSISTENT=true\n          else\n            # Temporary keys are acceptable for install/testing APKs only. AAB release builds are blocked above.\n            keytool -genkeypair -noprompt -keystore \"$KEYSTORE\" -storepass wybuild-temp-store -keypass wybuild-temp-key -alias wybuild -keyalg RSA -keysize 3072 -validity 10000 -dname 'CN=WyBuild Temporary Test Key, O=WyBuild, C=NG'\n            ALIAS=wybuild; KP=wybuild-temp-key; SP=wybuild-temp-store\n          fi\n          EXPECTED_SHA=\"$(keytool -list -v -keystore \"$KEYSTORE\" -storepass \"$SP\" -alias \"$ALIAS\" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr '[:lower:]' '[:upper:]')\"\n          while IFS= read -r -d '' apk; do\n            TOOL=\"$(find \"$ANDROID_HOME/build-tools\" -name apksigner | sort -V | tail -1)\"\n            if \"$TOOL\" verify --print-certs \"$apk\" > /tmp/wybuild-apk-cert.txt 2>&1; then\n              ACTUAL_SHA=\"$(awk -F': ' '/Signer #1 certificate SHA-256 digest/{print $2; exit}' /tmp/wybuild-apk-cert.txt | tr -d ':' | tr '[:lower:]' '[:upper:]')\"\n              if [ -z \"$ACTUAL_SHA\" ]; then echo '::error::Could not inspect APK signing certificate.'; exit 1; fi\n              if [ \"$PERSISTENT\" = true ] && [ \"$ACTUAL_SHA\" != \"$EXPECTED_SHA\" ]; then echo '::error::APK is already signed with a different certificate than the configured upload key. Align the Gradle release signing config and GitHub Actions secrets.'; exit 1; fi\n              echo \"APK already signed; verified certificate $ACTUAL_SHA\"\n            else\n              \"$TOOL\" sign --ks \"$KEYSTORE\" --ks-key-alias \"$ALIAS\" --ks-pass \"pass:$SP\" --key-pass \"pass:$KP\" \"$apk\"\n              \"$TOOL\" verify \"$apk\"\n            fi\n          done < <(find . -type f -name '*.apk' -path '*/build/outputs/apk/*' -print0)\n          while IFS= read -r -d '' aab; do\n            if jarsigner -verify \"$aab\" >/dev/null 2>&1; then\n              ACTUAL_SHA=\"$(keytool -printcert -jarfile \"$aab\" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr '[:lower:]' '[:upper:]')\"\n              if [ \"$PERSISTENT\" != true ] || [ -z \"$ACTUAL_SHA\" ] || [ \"$ACTUAL_SHA\" != \"$EXPECTED_SHA\" ]; then\n                echo '::error::AAB is already signed with a different or unknown certificate. Configure the same persistent upload key used by your app and rebuild.'; exit 1\n              fi\n            else\n              if [ \"$PERSISTENT\" != true ]; then echo '::error::AAB must use a persistent upload keystore.'; exit 1; fi\n              jarsigner -keystore \"$KEYSTORE\" -storepass \"$SP\" -keypass \"$KP\" \"$aab\" \"$ALIAS\"\n              jarsigner -verify \"$aab\"\n              SIGNED_SHA=\"$(keytool -printcert -jarfile \"$aab\" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr '[:lower:]' '[:upper:]')\"\n              if [ \"$SIGNED_SHA\" != \"$EXPECTED_SHA\" ]; then echo '::error::AAB signing certificate does not match the configured persistent upload key.'; exit 1; fi\n            fi\n          done < <(find . -type f -name '*.aab' -path '*/build/outputs/bundle/*' -print0)\n\n      - name: Build Next.js static web export\n        if: steps.detect.outputs.type == 'next' && (inputs.build_type == 'web' || inputs.build_type == 'auto')\n        shell: bash\n        run: |\n          set -euo pipefail\n          npm run build\n          mkdir -p wybuild-output\n          if [ -d out ]; then cp -R out/. wybuild-output/; else echo '::error::This Next.js app did not produce a static out/ directory. For a standalone web artifact, configure output: export; for server-rendered apps, deploy it and build a TWA from its HTTPS URL.'; exit 1; fi\n          test -f wybuild-output/index.html || { echo '::error::Next.js static export is missing index.html'; exit 1; }\n      - name: Upload web output\n        if: inputs.build_type == 'web' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))\n        uses: actions/upload-artifact@v4\n        with:\n          name: wybuild-web-${{ github.run_number }}\n          path: 'wybuild-output/*'\n          if-no-files-found: error\n          retention-days: 7\n      - name: Upload APK\n        if: inputs.build_type == 'apk' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')) || (inputs.build_type == 'twa' && inputs.twa_output == 'apk')\n        uses: actions/upload-artifact@v4\n        with:\n          name: wybuild-apk-${{ github.run_number }}\n          path: '**/build/outputs/apk/**/*.apk'\n          if-no-files-found: error\n          retention-days: 7\n      - name: Upload AAB\n        if: inputs.build_type == 'aab' || (inputs.build_type == 'twa' && inputs.twa_output == 'aab')\n        uses: actions/upload-artifact@v4\n        with:\n          name: wybuild-aab-${{ github.run_number }}\n          path: '**/build/outputs/bundle/**/*.aab'\n          if-no-files-found: error\n          retention-days: 7\n      - name: Notify WyBuild about build result (FCM)\n        if: always()\n        shell: bash\n        env:\n          NOTIFY_URL: __WYBUILD_NOTIFY_URL__\n          NOTIFY_SECRET: ${{ secrets.WYBUILD_NOTIFY_SECRET }}\n          CONCLUSION: ${{ job.status }}\n          REPOSITORY: ${{ github.repository }}\n          RUN_ID: ${{ github.run_id }}\n          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\n        run: |\n          if [ -n \"${NOTIFY_SECRET:-}\" ] && [ -n \"${NOTIFY_URL:-}\" ]; then\n            owner=\"${REPOSITORY%%/*}\"\n            repo=\"${REPOSITORY##*/}\"\n            payload=\"$(python3 -c 'import json,os; print(json.dumps({\"owner\":os.environ[\"REPOSITORY\"].split(\"/\")[0],\"repo\":os.environ[\"REPOSITORY\"].split(\"/\")[1],\"run_id\":os.environ[\"RUN_ID\"],\"conclusion\":os.environ[\"CONCLUSION\"],\"run_url\":os.environ[\"RUN_URL\"]}))')\"\n            curl --silent --show-error --max-time 8 -X POST \"$NOTIFY_URL\" -H \"Authorization: Bearer $NOTIFY_SECRET\" -H 'Content-Type: application/json' --data \"$payload\" || echo 'WyBuild push notification callback was unavailable; build result remains available in GitHub Actions.'\n          fi\n";
+
+export default async function handler(req, res) {
+  try {
+    const u = urlOf(req);
+    const route = u.pathname.replace(/^\/api\/?/, '');
+
+    if (req.method === 'GET' && route === 'health') {
+      return json(res, 200, { ok: true, service: 'wybuild' });
+    }
+
+    if (req.method === 'GET' && route === 'auth/github') {
+      if (!configured()) {
+        return json(res, 503, { error: 'GitHub authentication is not configured. Set APP_URL, SESSION_SECRET, GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.' });
+      }
+      const state = crypto.randomBytes(24).toString('hex');
+      setCookie(res, STATE_COOKIE, state, 600);
+      const p = new URLSearchParams({
+        client_id: process.env.GITHUB_CLIENT_ID,
+        redirect_uri: callback(req),
+        state,
+        scope: 'read:user user:email repo workflow'
+      });
+      res.statusCode = 302;
+      res.setHeader('Location', `https://github.com/login/oauth/authorize?${p}`);
+      return res.end();
+    }
+
+    if (req.method === 'GET' && route === 'auth/github/callback') {
+      if (!configured()) return json(res, 503, { error: 'GitHub authentication is not configured.' });
+      const c = cookies(req);
+      const code = u.searchParams.get('code');
+      const state = u.searchParams.get('state');
+      if (!code || !state || state !== c[STATE_COOKIE]) {
+        return json(res, 400, { error: 'GitHub connection failed: invalid OAuth state.' });
+      }
+
+      const tr = await fetch('https://github.com/login/oauth/access_token', {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: process.env.GITHUB_CLIENT_ID,
+          client_secret: process.env.GITHUB_CLIENT_SECRET,
+          code,
+          redirect_uri: callback(req)
+        })
+      });
+      const token = await tr.json();
+      if (!token.access_token) throw new Error(token.error_description || 'GitHub token exchange failed');
+
+      const me = await gh('/user', token.access_token);
+      setCookie(res, COOKIE, seal({
+        token: token.access_token,
+        user: { id: me.id, login: me.login, name: me.name, avatar: me.avatar_url }
+      }));
+      clearCookie(res, STATE_COOKIE);
+      res.statusCode = 302;
+      res.setHeader('Location', `${appBase(req)}/projects`);
+      return res.end();
+    }
+
+    if (req.method === 'POST' && route === 'auth/logout') {
+      clearCookie(res, COOKIE);
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === 'POST' && route === 'notifications/build') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const expected = await kv.get(notifyRepoKey(owner, repo));
+      const supplied = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+      if (!expected || !supplied || supplied.length !== String(expected).length || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(String(expected)))) {
+        return json(res, 401, { error: 'Invalid build notification callback credential.' });
+      }
+      const userId = await kv.get(notifyUserKey(owner, repo));
+      if (!userId) return json(res, 200, { ok: true, notified: false, reason: 'No WyBuild notification recipient is registered for this repository.' });
+      const conclusion = String(b.conclusion || 'completed').toLowerCase();
+      const success = conclusion === 'success';
+      try {
+        const result = await sendFcmToUser(String(userId), {
+          title: success ? 'WyBuild build succeeded' : 'WyBuild build failed',
+          body: `${owner}/${repo}: ${success ? 'build completed successfully' : `build finished with status ${conclusion}`}.`,
+          url: String(b.run_url || ''), repo: `${owner}/${repo}`, conclusion
+        });
+        return json(res, 200, { ok: true, notified: result.sent > 0, sent: result.sent, fcmConfigured: result.configured });
+      } catch (e) {
+        return json(res, 503, { error: e.message || 'FCM delivery failed.' });
+      }
+    }
+
+    if (req.method === 'GET' && route === 'auth/me') {
+      const s = session(req);
+      if (!s) return json(res, 200, { authenticated: false });
+      try {
+        const me = await gh('/user', s.token);
+        return json(res, 200, { authenticated: true, user: { id: me.id, login: me.login, name: me.name, avatar: me.avatar_url } });
+      } catch {
+        clearCookie(res, COOKIE);
+        return json(res, 401, { authenticated: false, error: 'GitHub session expired or revoked.' });
+      }
+    }
+
+    const s = requireSession(req, res);
+    if (!s) return;
+
+    if (req.method === 'POST' && route === 'notifications/register') {
+      const b = await body(req);
+      const token = String(b.token || '').trim();
+      if (token.length < 20 || token.length > 4096) return json(res, 400, { error: 'Invalid Firebase registration token.' });
+      const key = `wybuild_fcm_tokens:${s.user.id}`;
+      const tokens = decodeKvJson(await kv.get(key), []);
+      const next = Array.isArray(tokens) ? tokens.filter(t => t !== token).concat(token).slice(-5) : [token];
+      await kv.set(key, JSON.stringify(next));
+      return json(res, 200, { ok: true, registered: true, devices: next.length });
+    }
+
+    if (req.method === 'GET' && route === 'billing/status') {
+      try {
+        const d = await wydevEntitlement(s);
+        // Display the same successful-build usage that the dispatch endpoint
+        // enforces. Billing may expose its own usage counter, but WyBuild's
+        // build quota is specifically based on successful GitHub Actions runs.
+        const usage = await countMonthlyBuilds(s);
+        const plan = String(d.plan || 'FREE').toUpperCase();
+        return json(res, 200, {
+          ...d,
+          plan,
+          buildsUsed: usage.successful,
+          successfulBuilds: usage.successful,
+          inProgressBuilds: usage.active,
+          concurrencyLimit: PLAN_CONCURRENCY[plan] ?? PLAN_CONCURRENCY.FREE,
+          source: 'free-beta',
+          beta: true,
+          billingUrl: undefined
+        });
+      } catch (e) {
+        return json(res, e.status || 502, { error: e.message || 'WyDev billing service unavailable' });
+      }
+    }
+
+    // Owner-only: wipes this month's WyBuild quota by cancelling any
+    // in-progress runs and deleting this month's WyBuild workflow runs
+    // (success + in-progress) across every repo the account can see. This is
+    // intentionally NOT exposed to regular users - letting anyone reset their
+    // own usage on demand would make the monthly build limit meaningless.
+    const RESET_USAGE_OWNER = 'wytzbot';
+    if (req.method === 'POST' && route === 'billing/reset-usage') {
+      if (String(s.user.login || '').toLowerCase() !== RESET_USAGE_OWNER) {
+        return json(res, 403, { error: 'Not authorized to reset usage.' });
+      }
+      try {
+        const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
+          maxPages: MAX_REPO_PAGES,
+          perPage: 100
+        });
+        if (!Array.isArray(repos)) {
+          throw Object.assign(new Error('GitHub returned an invalid repository list.'), { status: 502 });
+        }
+        const created = encodeURIComponent(`>=${monthStartISO()}`);
+        let deleted = 0;
+        let cancelled = 0;
+        let failed = 0;
+
+        for (let i = 0; i < repos.length; i += 5) {
+          const chunk = repos.slice(i, i + 5);
+          await Promise.all(chunk.map(async repo => {
+            const base = `/repos/${encodeURIComponent(repo.owner.login)}/${encodeURIComponent(repo.name)}/actions/runs`;
+            let runs = [];
+            try {
+              const [successRuns, activeRuns] = await Promise.all([
+                ghList(`${base}?created=${created}&conclusion=success`, s.token, { keyName: 'workflow_runs', maxPages: 1, perPage: 100 }),
+                ghList(`${base}?created=${created}&status=in_progress`, s.token, { keyName: 'workflow_runs', maxPages: 1, perPage: 100 })
+              ]);
+              runs = [...successRuns, ...activeRuns].filter(run => run.name === 'WyBuild');
+            } catch { return; }
+
+            for (const run of runs) {
+              // Cancelling first matters even if delete fails below - a
+              // cancelled run's status is no longer in_progress, so it stops
+              // reserving a quota slot immediately.
+              if (run.status === 'in_progress' || run.status === 'queued') {
+                try { await gh(`${base}/${run.id}/cancel`, s.token, { method: 'POST' }); cancelled += 1; } catch {}
+              }
+              try {
+                await gh(`${base}/${run.id}`, s.token, { method: 'DELETE' });
+                deleted += 1;
+              } catch {
+                failed += 1;
+              }
+            }
+          }));
+        }
+
+        // Live GitHub runs are only half of countMonthlyBuilds' picture - a
+        // run deleted earlier this month via github/delete-run is counted
+        // from the KV ledger instead (see recordDeletedRun), specifically so
+        // deleting a run can't be used to dodge quota. Reset needs to clear
+        // that too, or usage won't actually return to zero after this call.
+        // Any ledger entries relevant to this reset are for runs created
+        // this month (the `created` filter above already restricts deletion
+        // to those), so the current month's ledger key covers all of them.
+        let ledgerCleared = 0;
+        try {
+          const key = ledgerKey(s.user.login, new Date());
+          ledgerCleared = Number(await kv.get(key)) || 0;
+          if (ledgerCleared > 0) await kv.del(key);
+        } catch { /* best-effort - live-run deletion above still succeeded */ }
+
+        return json(res, 200, {
+          ok: true,
+          deleted,
+          cancelled,
+          failed,
+          ledgerCleared,
+          message: `Cleared ${deleted} run${deleted === 1 ? '' : 's'} counted toward this month's quota${ledgerCleared ? ` and ${ledgerCleared} previously-deleted run${ledgerCleared === 1 ? '' : 's'} still on the ledger` : ''}${failed ? ` (${failed} could not be removed - likely still finishing on GitHub's side, retry in a minute).` : '.'}`
+        });
+      } catch (e) {
+        return json(res, e.status || 502, { error: e.message || 'Failed to reset usage.' });
+      }
+    }
+
+    if (req.method === 'GET' && route === 'github/repos') {
+      const repos = await ghList('/user/repos?sort=updated&affiliation=owner,collaborator,organization_member', s.token, {
+        maxPages: MAX_REPO_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, repos);
+    }
+
+    if (req.method === 'GET' && route === 'github/branches') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const branches = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/branches`, s.token, {
+        maxPages: MAX_BRANCH_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, branches);
+    }
+
+    if (req.method === 'GET' && route === 'github/diagnose') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const ref = safePart(u.searchParams.get('ref'), 'ref');
+
+      const exists = async (path) => {
+        try { await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/${path}?ref=${encodeURIComponent(ref)}`, s.token); return true; }
+        catch (e) { if (e.status === 404) return false; throw e; }
+      };
+
+      const [pubspec, gradlew, packageJson, indexHtml, vite, next, npmLock, pnpmLock, yarnLock, manifestJson, manifestWebmanifest, publicManifest, gitignore, rootEnv] = await Promise.all([
+        exists('pubspec.yaml'), findGradlewAnywhere(o, r, ref, s.token), exists('package.json'), exists('index.html'),
+        exists('vite.config.js'), exists('next.config.js'), exists('package-lock.json'), exists('pnpm-lock.yaml'),
+        exists('yarn.lock'), exists('manifest.json'), exists('manifest.webmanifest'), exists('public/manifest.webmanifest'),
+        exists('.gitignore'), exists('.env')
+      ]);
+
+      let type = 'unknown';
+      if (pubspec) type = 'flutter';
+      else if (gradlew) type = 'gradle';
+      else if (packageJson) type = next ? 'next' : 'node-web';
+      else if (indexHtml) type = 'vanilla';
+
+      const checks = [
+        { label: 'Flutter pubspec.yaml', ok: pubspec },
+        { label: 'Android Gradle wrapper (gradlew)', ok: gradlew },
+        { label: 'package.json', ok: packageJson },
+        { label: 'index.html / static entry', ok: indexHtml },
+        { label: 'Vite configuration', ok: vite },
+        { label: 'Next.js configuration', ok: next },
+        { label: 'Dependency lockfile (npm/pnpm/yarn)', ok: npmLock || pnpmLock || yarnLock },
+        { label: 'PWA manifest (required for TWA)', ok: manifestJson || manifestWebmanifest || publicManifest },
+        { label: '.gitignore present', ok: gitignore },
+        { label: 'No root .env file committed', ok: !rootEnv }
+      ];
+
+      const recommendation = type === 'flutter'
+        ? 'Flutter APK or AAB'
+        : type === 'gradle'
+          ? 'Existing Android APK or AAB'
+          : (type === 'node-web' || type === 'vanilla')
+            ? 'Web artifact or TWA from a deployed HTTPS PWA (no embedded WebView).'
+            : type === 'next'
+              ? 'Deploy the Next.js app over HTTPS, then use TWA; static export is required for standalone web artifacts.'
+              : 'Add a supported project entry point';
+
+      return json(res, 200, { type, checks, recommendation, ref });
+    }
+
+    if (req.method === 'GET' && route === 'github/play-readiness') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const ref = safePart(u.searchParams.get('ref'), 'ref');
+      const target = String(u.searchParams.get('target') || 'aab').toLowerCase();
+      const readText = async (path) => {
+        try {
+          const file = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/${path}?ref=${encodeURIComponent(ref)}`, s.token);
+          return Buffer.from(file.content || '', 'base64').toString('utf8');
+        } catch (e) { if (e.status === 404) return ''; throw e; }
+      };
+      const exists = async (path) => {
+        try { await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/${path}?ref=${encodeURIComponent(ref)}`, s.token); return true; }
+        catch (e) { if (e.status === 404) return false; throw e; }
+      };
+      const readPaths = [
+        'pubspec.yaml', 'package.json', 'android/app/build.gradle', 'android/app/build.gradle.kts',
+        'app/build.gradle', 'app/build.gradle.kts', 'build.gradle', 'build.gradle.kts',
+        'AndroidManifest.xml', 'android/app/src/main/AndroidManifest.xml', 'gradle.properties'
+      ];
+      const existsPaths = [
+        'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', '.gitignore', '.env', 'key.properties',
+        'manifest.json', 'manifest.webmanifest', 'public/manifest.webmanifest', 'next.config.js',
+        'next.config.mjs', 'next.config.ts', 'vite.config.js', 'vite.config.ts'
+      ];
+      const [readVals, existVals] = await Promise.all([
+        Promise.all(readPaths.map(async p => [p, await readText(p)])),
+        Promise.all(existsPaths.map(async p => [p, await exists(p)]))
+      ]);
+      const data = Object.fromEntries([...readVals, ...existVals]);
+      const files = Object.keys(data).filter(k => typeof data[k] === 'string' && data[k].length > 0);
+      const present = p => typeof data[p] === 'string' ? data[p].length > 0 : data[p] === true;
+      const gradleText = ['android/app/build.gradle','android/app/build.gradle.kts','app/build.gradle','app/build.gradle.kts','build.gradle','build.gradle.kts'].map(p => data[p] || '').join('\n');
+      const manifestText = (data['android/app/src/main/AndroidManifest.xml'] || '') + '\n' + (data['AndroidManifest.xml'] || '');
+      const pubspec = data['pubspec.yaml'] || '';
+      const packageJson = data['package.json'] || '';
+      let type = present('pubspec.yaml') ? 'flutter' : (gradleText || present('app/build.gradle') || present('android/app/build.gradle')) ? 'android' : present('package.json') ? (/("next"\s*:)/.test(packageJson) ? 'next' : 'web') : 'unknown';
+      const numeric = (patterns) => { for (const p of patterns) { const m = gradleText.match(p); if (m && m[1] && Number.isFinite(Number(m[1]))) return Number(m[1]); } return null; };
+      const targetSdk = numeric([/targetSdk(?:Version)?\s*(?:=\s*)?(?:flutter\.targetSdkVersion|\(?\s*(\d+)\s*\)?)/, /targetSdkVersion\s+(\d+)/]);
+      const compileSdk = numeric([/compileSdk(?:Version)?\s*(?:=\s*)?(?:flutter\.compileSdkVersion|\(?\s*(\d+)\s*\)?)/, /compileSdkVersion\s+(\d+)/]);
+      const versionCode = /versionCode\s*(?:=\s*)?\d+/.test(gradleText) || /version:\s*[^\n]+\+\d+/.test(pubspec);
+      const hasLock = present('package-lock.json') || present('pnpm-lock.yaml') || present('yarn.lock');
+      const hasGitignore = present('.gitignore');
+      const hasEnv = present('.env');
+      const hasReleaseSigning = /signingConfig\s*(?:=\s*)?signingConfigs\.release/.test(gradleText) || /signingConfigs\s*\{[\s\S]{0,800}release/.test(gradleText);
+      const keyPropertiesTracked = present('key.properties');
+      const isAab = target === 'aab' || target === 'twaaab' || (target === 'twa' && u.searchParams.get('output') === 'aab');
+      const checks = [];
+      const add = (label, status, detail) => checks.push({label, status, ok: status === 'pass', detail});
+      add('Supported project structure', type !== 'unknown' ? 'pass' : 'fail', type === 'unknown' ? 'Could not identify Flutter, Android/Gradle, or web project markers.' : `Detected ${type} project.`);
+      if (type === 'web' || type === 'next') add('Android target compatibility', 'warn', 'Web source is not directly an Android APK/AAB. Use the TWA target for a deployed HTTPS PWA; Next.js server features must remain hosted.');
+      if (type === 'android' || type === 'flutter') {
+        if (targetSdk !== null) add('Target SDK 36+', targetSdk >= 36 ? 'pass' : 'fail', `Detected target SDK ${targetSdk}; new Play submissions require API 36+ as of 31 August 2026.`);
+        else add('Target SDK 36+', 'warn', 'Could not safely resolve targetSdk from repository text; confirm the effective Android target is API 36 or higher.');
+        if (compileSdk !== null) add('Compile SDK 36+', compileSdk >= 36 ? 'pass' : 'warn', `Detected compile SDK ${compileSdk}; API 36 is recommended for current Play submissions.`);
+        else add('Compile SDK 36+', 'warn', 'Could not safely resolve compileSdk; verify the effective compile SDK in the Gradle build.');
+        add('Version code', versionCode ? 'pass' : 'warn', versionCode ? 'A version code/version build number was found.' : 'Confirm versionCode is present and incremented for every Play update.');
+        add('Release signing configuration', hasReleaseSigning ? 'pass' : 'warn', 'Confirm release signing uses the persistent upload key configured in GitHub Actions. A debug/temporary key is not suitable for a production release history.');
+        add('Signing secrets not committed', keyPropertiesTracked ? 'fail' : 'pass', keyPropertiesTracked ? 'key.properties is present in the repository. Remove it from version control and rotate any exposed passwords/keys.' : 'No root key.properties file detected; keep keystores and credentials outside source control.');
+        add('Android manifest', manifestText.trim() ? 'pass' : 'warn', manifestText.trim() ? 'Manifest found; verify exported components, permissions and app label.' : 'Manifest not found at common paths; Android plugin projects may generate it elsewhere.');
+      } else if (type === 'web' || type === 'next') {
+        add('Web dependencies locked', hasLock ? 'pass' : 'warn', hasLock ? 'A package lockfile is present.' : 'No npm/pnpm/yarn lockfile found; CI dependency resolution may drift.');
+        add('PWA manifest', present('manifest.json') || present('manifest.webmanifest') ? 'pass' : 'warn', 'Confirm the deployed site serves a valid manifest with app name, icons, start_url and display mode.');
+        add('TWA website verification', 'manual', 'For TWA, the deployed HTTPS origin must publish /.well-known/assetlinks.json matching the app package and signing certificate.');
+      }
+      add('Secrets hygiene', hasEnv ? 'warn' : 'pass', hasEnv ? 'A root .env file exists. Confirm it is ignored and not tracked; rotate any credentials that were committed.' : 'No root .env file detected; still check nested env files and repository history.');
+      add('Git ignore', hasGitignore ? 'pass' : 'warn', hasGitignore ? '.gitignore exists; ensure keystores, local.properties, build outputs and env files are excluded.' : 'Add .gitignore for local config, signing files, dependencies and build outputs.');
+      add('Play Console declarations', 'manual', 'Privacy policy, Data safety, app access, content rating, target audience and account deletion (if applicable) must be completed in Play Console.');
+      add('Store listing and app quality', 'manual', 'Check app icon, screenshots, real user value, broken links, sign-in flows, offline/error states and policy compliance.');
+      const blocked = checks.some(c => c.status === 'fail');
+      const warnings = checks.filter(c => c.status === 'warn').length;
+      return json(res, 200, {type, target, status: blocked ? 'blocked' : warnings ? 'review' : 'ready_for_review', checks, summary: blocked ? 'Fix blocking technical issues before attempting a Play release.' : 'No hard blockers were detected by static inspection. Complete manual checks and validate the built AAB in Play Console before submission.', currentPlayTargetSdk: 36, ref});
+    }
+
+    if (req.method === 'GET' && route === 'github/workflow') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const ref = safePart(u.searchParams.get('ref'), 'ref');
+
+      const repoInfo = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}`, s.token);
+      const defaultBranch = repoInfo.default_branch;
+      let exists = false;
+      let existsOnDefault = false;
+      let upToDate = null;
+      let installedVersion = null;
+      try {
+        const file = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(ref)}`, s.token);
+        exists = true;
+        try {
+          const content = Buffer.from(file.content || '', 'base64').toString('utf8');
+          const match = content.match(/^#\s*wybuild-workflow-version:\s*(\d+)/m);
+          installedVersion = match ? Number(match[1]) : 0;
+          upToDate = installedVersion >= WORKFLOW_VERSION;
+        } catch {
+          // Couldn't parse the file (unexpected format) - treat as needing a refresh.
+          upToDate = false;
+        }
+      } catch (e) {
+        if (e.status !== 404) throw e;
+      }
+      try {
+        const file = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(defaultBranch)}`, s.token);
+        existsOnDefault = true;
+        if (ref === defaultBranch && !exists) { exists = true; }
+        try {
+          const content = Buffer.from(file.content || '', 'base64').toString('utf8');
+          const match = content.match(/^#\s*wybuild-workflow-version:\s*(\d+)/m);
+          const defaultVersion = match ? Number(match[1]) : 0;
+          if (installedVersion == null) installedVersion = defaultVersion;
+          upToDate = defaultVersion >= WORKFLOW_VERSION;
+        } catch { upToDate = false; }
+      } catch (e) {
+        if (e.status !== 404) throw e;
+      }
+
+      // File-existence on this ref isn't enough: GitHub only lets you dispatch a
+      // workflow_dispatch run once the workflow is registered, which only happens once
+      // the file is on the default branch. Check the real Actions registry too.
+      let dispatchable = false;
+      try {
+        const workflows = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/workflows`, s.token, {
+          keyName: 'workflows',
+          maxPages: 3,
+          perPage: 100
+        });
+        dispatchable = workflows.some(w => w.path === '.github/workflows/wybuild.yml' && w.state === 'active');
+      } catch { /* leave dispatchable false; UI will prompt to install/merge */ }
+
+      return json(res, 200, { exists, existsOnDefault, defaultBranch, dispatchable, upToDate, installedVersion, currentVersion: WORKFLOW_VERSION });
+    }
+
+
+    if (req.method === 'POST' && route === 'github/install-workflow') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const ref = safePart(b.ref, 'ref');
+      const branch = `wybuild/setup-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      let notificationsConfigured = false;
+      const repoInfo = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, s.token);
+      const defaultBranch = repoInfo.default_branch;
+      // IMPORTANT: setup must always branch from the repository's default branch.
+      // The selected ref may contain unrelated user work; using it as the PR base
+      // could accidentally merge that work into the default branch along with the
+      // WyBuild workflow. The selected ref is only the target that will later be
+      // dispatched for the build.
+      const baseRef = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(defaultBranch)}`, s.token);
+
+      await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs`, s.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseRef.object.sha })
+      });
+
+      try {
+        // The new branch is cut from baseRef, so if wybuild.yml already exists there
+        // (the common "installed but outdated" case), GitHub's contents API requires
+        // that file's current sha to overwrite it - omitting it fails with
+        // `Invalid request. "sha" wasn't supplied.`. Look it up on the branch we just
+        // created (same content as baseRef) and include it when present.
+        let existingSha;
+        try {
+          const existing = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml?ref=${encodeURIComponent(branch)}`, s.token);
+          existingSha = existing.sha;
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+
+        await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/.github/workflows/wybuild.yml`, s.token, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: existingSha ? 'chore: update WyBuild workflow' : 'chore: add WyBuild workflow',
+            content: Buffer.from(WORKFLOW.replaceAll('__WYBUILD_NOTIFY_URL__', `${(process.env.APP_URL || 'https://wybuild.vercel.app').replace(/\/$/, '')}/api/notifications/build`)).toString('base64'),
+            branch,
+            ...(existingSha ? { sha: existingSha } : {})
+          })
+        });
+
+        // FCM callback credentials are unique per repository. If the GitHub OAuth
+        // token cannot manage Actions secrets, the workflow still installs; push
+        // delivery remains disabled for this repository until permissions are fixed.
+        try {
+          const notifySecret = crypto.randomBytes(32).toString('hex');
+          await upsertGitHubActionSecret(owner, repo, 'WYBUILD_NOTIFY_SECRET', notifySecret, s.token);
+          await kv.set(notifyRepoKey(owner, repo), notifySecret);
+          await kv.set(notifyUserKey(owner, repo), String(s.user.id));
+          notificationsConfigured = true;
+        } catch (notifySetupError) {
+          // Do not block builds if a GitHub account lacks Actions-secret permissions.
+        }
+
+      } catch (e) {
+        // Best-effort cleanup if workflow creation fails.
+        try { await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/refs/heads/${encodeURIComponent(branch)}`, s.token, { method: 'DELETE' }); } catch {}
+        throw e;
+      }
+
+      // GitHub only ever registers a workflow_dispatch-triggerable workflow once the
+      // file exists on the repo's default branch - a copy on a side branch is invisible
+      // to the dispatch endpoint no matter what ref you pass it. Open a PR into the
+      // default branch and try to merge it automatically so builds work immediately;
+      // if that's blocked (branch protection, permissions, existing PR), fall back to
+      // surfacing the PR link so the user can merge it themselves.
+      let prUrl, merged = false;
+      if (branch !== defaultBranch) {
+        try {
+          const pr = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls`, s.token, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: 'Add WyBuild workflow',
+              head: branch,
+              base: defaultBranch,
+              body: 'Adds the WyBuild GitHub Actions workflow.\n\nGitHub only allows manually-triggered (`workflow_dispatch`) workflows to run once they exist on the default branch, so this needs to be merged before WyBuild can start builds.'
+            })
+          });
+          prUrl = pr.html_url;
+          try {
+            await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pr.number}/merge`, s.token, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ merge_method: 'squash' })
+            });
+            merged = true;
+          } catch { /* protected branch, no permission, etc - user merges manually via prUrl */ }
+        } catch { /* PR creation failed - still return the branch so the user can act on it */ }
+      }
+
+      return json(res, 201, {
+        ok: true,
+        notificationsConfigured,
+        branch,
+        defaultBranch,
+        prUrl,
+        merged,
+        message: merged
+          ? 'WyBuild workflow installed and merged into the default branch. You can build now.'
+          : prUrl
+            ? `WyBuild workflow committed and a pull request opened into ${defaultBranch}. Merge it before building - GitHub only allows manual builds for workflows on the default branch.`
+            : `WyBuild workflow committed to ${branch}, but WyBuild could not open a pull request automatically. Open one into ${defaultBranch} and merge it before building.`
+      });
+    }
+
+    if (req.method === 'GET' && route === 'github/runs') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const created = u.searchParams.get('created');
+      const query = created ? `?created=${encodeURIComponent(created)}` : '';
+
+      const cacheKey = runsCacheKey(s.user.login, o, r, created);
+      const cached = await kv.get(cacheKey).catch(() => null);
+      if (cached) {
+        return json(res, 200, cached);
+      }
+
+      // Query the WyBuild workflow's own runs endpoint rather than every
+      // Actions run in the repo. Repos that also run other CI (tests, lint,
+      // release workflows, ...) were forcing us to page through all of that
+      // history just to throw most of it away in the `name === 'WyBuild'`
+      // filter the frontend used to do - this returns only WyBuild runs to
+      // begin with, so far fewer pages (often just one) are fetched.
+      let runs;
+      try {
+        runs = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/workflows/wybuild.yml/runs${query}`, s.token, {
+          keyName: 'workflow_runs',
+          maxPages: MAX_RUN_PAGES,
+          perPage: 100
+        });
+      } catch (e) {
+        // No wybuild.yml registered on this repo (never installed, or only
+        // committed to a branch that isn't the default yet) - zero runs
+        // rather than a 404 bubbling up to the Builds page.
+        if (e.status === 404) runs = [];
+        else throw e;
+      }
+
+      // Auto-hide (not delete) failed runs older than FAILED_RUN_HIDE_DAYS so
+      // they stop cluttering the Builds page. The underlying GitHub Actions
+      // run is untouched - this only affects what WyBuild displays.
+      const hideCutoff = Date.now() - FAILED_RUN_HIDE_DAYS * 86400000;
+      const visible = runs.filter(run => (
+        run.conclusion !== 'failure' || new Date(run.created_at).getTime() >= hideCutoff
+      ));
+
+      const payload = { total_count: visible.length, workflow_runs: visible };
+      await kv.set(cacheKey, payload, { ex: RUNS_CACHE_TTL_SECONDS }).catch(() => {});
+      return json(res, 200, payload);
+    }
+
+    if (req.method === 'GET' && route === 'github/run') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      return json(res, 200, await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}`, s.token));
+    }
+
+    if (req.method === 'POST' && route === 'github/delete-run') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const id = safePart(b.id, 'id');
+      const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${encodeURIComponent(id)}`;
+
+      const run = await gh(base, s.token);
+      if (run.name !== 'WyBuild') {
+        return json(res, 403, { error: 'Only WyBuild runs can be deleted here.' });
+      }
+
+      if (run.status === 'in_progress' || run.status === 'queued') {
+        try { await gh(`${base}/cancel`, s.token, { method: 'POST' }); } catch { /* best-effort */ }
+      }
+
+      // Record BEFORE deleting: a successful run must still count toward quota
+      // even once removed from GitHub. See recordDeletedRun for the tradeoff.
+      if (run.conclusion === 'success') {
+        await recordDeletedRun(s, { owner, repo, runId: id, createdAt: run.created_at });
+      }
+
+      await gh(base, s.token, { method: 'DELETE' });
+      await invalidateRunsCache(s.user.login, owner, repo);
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === 'GET' && route === 'github/run-failure') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+
+      const jobsData = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}/jobs`, s.token);
+      const jobs = Array.isArray(jobsData.jobs) ? jobsData.jobs : [];
+      const failedJobs = jobs.filter(j => j.conclusion === 'failure');
+
+      const results = await Promise.all(failedJobs.map(async job => {
+        const steps = Array.isArray(job.steps) ? job.steps : [];
+        const failedStep = steps.find(st => st.conclusion === 'failure') || null;
+        let annotations = [];
+        try {
+          annotations = await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/check-runs/${job.id}/annotations`, s.token);
+        } catch { /* annotations best-effort - fall back to step name only */ }
+        return {
+          jobName: job.name,
+          jobId: job.id,
+          failedStep: failedStep ? { name: failedStep.name, number: failedStep.number } : null,
+          annotations: (Array.isArray(annotations) ? annotations : [])
+            .filter(a => a.annotation_level === 'failure')
+            .map(a => ({ title: a.title || null, message: a.message || null }))
+        };
+      }));
+
+      return json(res, 200, { failedJobs: results });
+    }
+
+    if (req.method === 'POST' && route === 'github/rebuild') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const ref = safePart(b.ref, 'ref');
+      const buildType = ['auto','aab','apk','web','twa'].includes(b.build_type) ? b.build_type : 'apk';
+      const buildMode = b.build_mode === 'debug' ? 'debug' : 'release';
+      const entitlement = await wydevEntitlement(s);
+      const limit = Number(entitlement.buildLimit);
+      if (!Number.isFinite(limit) || limit < 0) return json(res, 502, { error: 'Billing returned an invalid build limit.' });
+
+      // Same per-account lock and concurrency gate as github/dispatch (the
+      // "Build Now" flow). Without this, tapping "Rebuild" twice quickly, or
+      // rebuilding from several run cards at once, raced past the quota
+      // check below and could exceed the plan's concurrency limit - unlike
+      // "Build Now", which was already guarded.
+      const lockKey = `${s.user.id}:${new Date().toISOString().slice(0, 7)}`;
+      if (activeBuildLocks.has(lockKey)) {
+        return json(res, 409, { error: 'Another WyBuild request is already being started for this account. Wait a few seconds and retry.', code: 'BUILD_REQUEST_IN_PROGRESS' });
+      }
+      activeBuildLocks.set(lockKey, Date.now());
+
+      let usage;
+      try {
+        usage = await countMonthlyBuilds(s);
+      } catch (e) {
+        activeBuildLocks.delete(lockKey);
+        throw e;
+      }
+      const plan = String(entitlement.plan || 'FREE').toUpperCase();
+      const concurrency = PLAN_CONCURRENCY[plan] ?? PLAN_CONCURRENCY.FREE;
+      if (usage.successful >= limit || usage.reserved >= limit) {
+        activeBuildLocks.delete(lockKey);
+        return json(res, 402, {
+          error: `Monthly successful-build limit reached (${usage.successful}/${limit}).`,
+          code: 'BUILD_LIMIT_REACHED',
+          plan, buildsUsed: usage.successful, buildLimit: limit,
+          billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      }
+      if (usage.active >= concurrency) {
+        activeBuildLocks.delete(lockKey);
+        return json(res, 402, {
+          error: `${plan} allows ${concurrency} build${concurrency === 1 ? '' : 's'} in progress at once (${usage.active} running now). Wait for one to finish${plan === 'FREE' ? ', or upgrade to run builds in parallel' : ''}.`,
+          code: 'CONCURRENCY_LIMIT_REACHED',
+          plan, concurrencyLimit: concurrency, inProgressBuilds: usage.active,
+          buildsUsed: usage.successful, buildLimit: limit,
+          billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      }
+      const nativeFeatures = normalizeNativeFeatures(b.native_features, plan);
+
+      // GitHub rejects a dispatch outright (400 "Unexpected inputs
+      // provided") if the workflow_dispatch inputs we send don't match what
+      // the installed wybuild.yml declares on this ref - which happens for
+      // any repo still on a workflow version older than when a given input
+      // was added. Check first and fail with a clear, actionable message
+      // instead of surfacing GitHub's raw validation error.
+      try {
+        const repoInfo = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, s.token);
+        const workflowRef = repoInfo.default_branch;
+        const workflowContent = await fetchWorkflowContent(owner, repo, workflowRef, s.token);
+        if (!workflowContent) {
+          return json(res, 409, {
+            error: 'WyBuild workflow not found on this branch. Install it from the Projects tab first.',
+            code: 'WORKFLOW_NOT_INSTALLED'
+          });
+        }
+        const installedMatch = workflowContent.match(/^#\s*wybuild-workflow-version:\s*(\d+)/m);
+        const installedVersion = installedMatch ? Number(installedMatch[1]) : 0;
+        if (installedVersion < WORKFLOW_VERSION) {
+          return json(res, 409, {
+            error: `This repository is running WyBuild workflow v${installedVersion || 'unknown'}, but v${WORKFLOW_VERSION} is required. Update it from the Projects tab, then build again.`,
+            code: 'WORKFLOW_OUTDATED',
+            installedVersion,
+            requiredVersion: WORKFLOW_VERSION
+          });
+        }
+
+        await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/wybuild.yml/dispatches`, s.token, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ref, inputs: { build_type: buildType, build_mode: buildMode, native_features: nativeFeatures.join(','), web_app_url: String(inputs.web_app_url || ''), app_id: String(inputs.app_id || 'com.example.myapp'), app_name: String(inputs.app_name || 'My App'), twa_output: inputs.twa_output === 'aab' ? 'aab' : 'apk' } })
+        });
+      } finally {
+        activeBuildLocks.delete(lockKey);
+      }
+      await invalidateRunsCache(s.user.login, owner, repo);
+      return json(res, 202, { ok: true, status: 'queued', nativeFeatures, buildLimit: limit, buildsUsed: usage.successful });
+    }
+
+    if (req.method === 'POST' && route === 'github/rerun') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const id = safePart(b.id, 'id');
+      // Reruns the exact same run (same workflow_dispatch inputs) rather than a
+      // fresh dispatch, since GitHub's run object doesn't expose the original
+      // inputs for us to replay via a new dispatch call.
+      await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/runs/${encodeURIComponent(id)}/rerun`, s.token, { method: 'POST' });
+      await invalidateRunsCache(s.user.login, owner, repo);
+      return json(res, 200, { ok: true });
+    }
+
+    if (req.method === 'GET' && route === 'github/artifacts') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      return json(res, 200, await gh(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}/artifacts?per_page=100`, s.token));
+    }
+
+    if (req.method === 'GET' && route === 'github/artifact') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      const rr = await fetch(`${GH}/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/artifacts/${encodeURIComponent(id)}/zip`, {
+        headers: { Authorization: `Bearer ${s.token}`, 'X-GitHub-Api-Version': '2022-11-28' }
+      });
+      if (!rr.ok) return json(res, rr.status, { error: 'Artifact download unavailable' });
+      const zipBuf = Buffer.from(await rr.arrayBuffer());
+      const archive = new AdmZip(zipBuf);
+      const entries = archive.getEntries().filter(e => !e.isDirectory);
+      const wanted = entries.find(e => /\.(apk|aab)$/i.test(e.entryName));
+      if (wanted) {
+        const file = wanted.getData();
+        const isAab = /\.aab$/i.test(wanted.entryName);
+        const filename = wanted.entryName.split('/').pop() || (isAab ? 'app-release.aab' : 'app-release.apk');
+        res.statusCode = 200;
+        res.setHeader('Content-Type', isAab ? 'application/octet-stream' : 'application/vnd.android.package-archive');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+        res.setHeader('Content-Length', String(file.length));
+        res.end(file);
+        return;
+      }
+      // No .apk/.aab inside - this is a "web" build artifact, which is a
+      // directory of static site files, not a single installable file.
+      // The frontend's "Download Web Build" button hits this same route, so
+      // rather than 404 (the previous behaviour), serve GitHub's zip as-is.
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="wybuild-web-${id}.zip"`);
+      res.setHeader('Content-Length', String(zipBuf.length));
+      res.end(zipBuf);
+      return;
+    }
+
+    if (req.method === 'GET' && route === 'github/logs') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const id = safePart(u.searchParams.get('id'), 'id');
+      const rr = await fetch(`${GH}/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/actions/runs/${encodeURIComponent(id)}/logs`, {
+        headers: { Authorization: `Bearer ${s.token}`, 'X-GitHub-Api-Version': '2022-11-28' }
+      });
+      if (!rr.ok) return json(res, rr.status, { error: 'GitHub logs unavailable' });
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="wybuild-logs-${id}.zip"`);
+      res.end(Buffer.from(await rr.arrayBuffer()));
+      return;
+    }
+
+    if (req.method === 'POST' && route === 'github/dispatch') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const ref = safePart(b.ref, 'ref');
+      const inputs = b.inputs && typeof b.inputs === 'object' ? b.inputs : {};
+      const buildType = ['auto','aab','apk','web','twa'].includes(inputs.build_type) ? inputs.build_type : null;
+      const buildMode = inputs.build_mode === 'release' ? 'release' : inputs.build_mode === 'debug' ? 'debug' : null;
+      if (!buildType || !buildMode) return json(res, 400, { error: 'build_type must be auto/apk/aab/web/twa and build_mode must be debug/release' });
+      if (buildType === 'twa') {
+        const webUrl = String(inputs.web_app_url || '').trim();
+        const appId = String(inputs.app_id || '').trim();
+        if (!/^https:\/\//i.test(webUrl)) return json(res, 400, { error: 'TWA builds require a deployed HTTPS website URL.' });
+        if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(appId)) return json(res, 400, { error: 'Enter a valid Android package ID, e.g. com.example.myapp.' });
+        const appName = String(inputs.app_name || 'My App').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/.test(appName)) return json(res, 400, { error: 'App name must be 1-40 letters, numbers, spaces, dots, underscores or hyphens.' });
+      }
+
+      const entitlement = await wydevEntitlement(s);
+      const limit = Number(entitlement.buildLimit);
+      if (!Number.isFinite(limit) || limit < 0) return json(res, 502, { error: 'Billing returned an invalid build limit.' });
+
+      const lockKey = `${s.user.id}:${new Date().toISOString().slice(0, 7)}`;
+      if (activeBuildLocks.has(lockKey)) {
+        return json(res, 409, { error: 'Another WyBuild request is already being started for this account. Wait a few seconds and retry.', code: 'BUILD_REQUEST_IN_PROGRESS' });
+      }
+      activeBuildLocks.set(lockKey, Date.now());
+
+      // Only completed successful builds consume the quota. In-flight builds
+      // temporarily reserve remaining slots so concurrent requests cannot
+      // oversubscribe the monthly successful-build allowance.
+      let usage;
+      try {
+        usage = await countMonthlyBuilds(s);
+      } catch (e) {
+        activeBuildLocks.delete(lockKey);
+        throw e;
+      }
+      const monthlyUsed = usage.successful;
+      const reserved = usage.reserved;
+      const plan = String(entitlement.plan || 'FREE').toUpperCase();
+      const nativeFeatures = normalizeNativeFeatures(inputs.native_features, plan);
+      const concurrency = PLAN_CONCURRENCY[plan] ?? PLAN_CONCURRENCY.FREE;
+      if (monthlyUsed >= limit || reserved >= limit) {
+        activeBuildLocks.delete(lockKey);
+        return json(res, 402, {
+          error: monthlyUsed >= limit
+            ? `Monthly successful-build limit reached (${monthlyUsed}/${limit}). Failed builds do not consume your quota.`
+            : `All remaining successful-build slots are currently in progress (${monthlyUsed} successful, ${usage.active} in progress, ${limit} allowed). Failed builds do not consume your quota.`,
+          code: 'BUILD_LIMIT_REACHED',
+          plan,
+          buildsUsed: monthlyUsed,
+          successfulBuilds: monthlyUsed,
+          inProgressBuilds: usage.active,
+          buildLimit: limit,
+          billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      }
+
+      if (usage.active >= concurrency) {
+        activeBuildLocks.delete(lockKey);
+        return json(res, 402, {
+          error: `${plan} allows ${concurrency} build${concurrency === 1 ? '' : 's'} in progress at once (${usage.active} running now). Wait for one to finish${plan === 'FREE' ? ', or upgrade to run builds in parallel' : ''}.`,
+          code: 'CONCURRENCY_LIMIT_REACHED',
+          plan,
+          concurrencyLimit: concurrency,
+          inProgressBuilds: usage.active,
+          buildsUsed: monthlyUsed,
+          buildLimit: limit,
+          billingUrl: entitlement.billingUrl || process.env.WYDEV_BILLING_URL || undefined
+        });
+      }
+
+      try {
+        // Same guard as github/rebuild: a repo can be "dispatchable" (the
+        // workflow is registered and active) while still running a version
+        // installed long before native_features existed - or, as seen on
+        // very old installs, before per-project-type detection existed at
+        // all (just a root-only `[ -f ./gradlew ]` check). GitHub's dispatch
+        // call succeeds either way since native_features is sent as a plain
+        // string input; the workflow itself then runs its old, narrower
+        // logic and fails on validation instead of building. Catch that
+        // here with an actionable message rather than letting it burn a
+        // build slot on a doomed run.
+        const repoInfo = await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, s.token);
+        const workflowRef = repoInfo.default_branch;
+        const workflowContent = await fetchWorkflowContent(owner, repo, workflowRef, s.token);
+        if (!workflowContent) {
+          return json(res, 409, { error: 'WyBuild workflow not found on this branch. Install it from the Projects tab first.', code: 'WORKFLOW_NOT_INSTALLED' });
+        }
+        const installedMatch = workflowContent.match(/^#\s*wybuild-workflow-version:\s*(\d+)/m);
+        const installedVersion = installedMatch ? Number(installedMatch[1]) : 0;
+        if (installedVersion < WORKFLOW_VERSION) {
+          return json(res, 409, {
+            error: `This repository is running WyBuild workflow v${installedVersion || 'unknown'}, but v${WORKFLOW_VERSION} is required. Update it from the Projects tab, then build again.`,
+            code: 'WORKFLOW_OUTDATED',
+            installedVersion,
+            requiredVersion: WORKFLOW_VERSION
+          });
+        }
+
+        await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/actions/workflows/wybuild.yml/dispatches`, s.token, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ref, inputs: { build_type: buildType, build_mode: buildMode, native_features: nativeFeatures.join(','), web_app_url: String(inputs.web_app_url || ''), app_id: String(inputs.app_id || 'com.example.myapp'), app_name: String(inputs.app_name || 'My App'), twa_output: inputs.twa_output === 'aab' ? 'aab' : 'apk' } })
+        });
+        await invalidateRunsCache(s.user.login, owner, repo);
+      } catch (e) {
+        if (e.status === 404) return json(res, 409, { error: 'WyBuild workflow is not installed on this branch. Install it first.', code: 'WORKFLOW_MISSING' });
+        if (e.status === 403) return json(res, 403, { error: 'GitHub denied workflow execution. Re-authorize WyBuild with the required repository permissions.', code: 'GITHUB_PERMISSION_DENIED' });
+        throw e;
+      } finally {
+        activeBuildLocks.delete(lockKey);
+      }
+
+      return json(res, 202, {
+        ok: true,
+        status: 'queued',
+        // A dispatched run is not a used build yet. The quota increments only
+        // when GitHub reports the WyBuild run conclusion as `success`.
+        buildsUsed: monthlyUsed,
+        successfulBuilds: monthlyUsed,
+        inProgressBuilds: usage.active + 1,
+        buildLimit: limit,
+        nativeFeatures
+      });
+    }
+
+    if (req.method === 'GET' && route === 'github/releases') {
+      const o = safePart(u.searchParams.get('owner'), 'owner');
+      const r = safePart(u.searchParams.get('repo'), 'repo');
+      const releases = await ghList(`/repos/${encodeURIComponent(o)}/${encodeURIComponent(r)}/releases`, s.token, {
+        maxPages: MAX_RELEASE_PAGES,
+        perPage: 100
+      });
+      return json(res, 200, releases);
+    }
+
+    if (req.method === 'POST' && route === 'github/releases') {
+      const b = await body(req);
+      const owner = safePart(b.owner, 'owner');
+      const repo = safePart(b.repo, 'repo');
+      const tag_name = safePart(b.tag_name, 'tag_name').trim();
+      const name = typeof b.name === 'string' ? b.name.trim() : '';
+      const notes = typeof b.body === 'string' ? b.body.trim() : '';
+      const target_commitish = typeof b.target_commitish === 'string' && b.target_commitish.trim() ? b.target_commitish.trim() : undefined;
+      const prerelease = !!b.prerelease;
+      const draft = !!b.draft;
+      if (!/^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(tag_name)) {
+        return json(res, 400, { error: 'Tag name must look like 1.0.0 or v1.0.0.' });
+      }
+
+      const releaseBody = {
+        tag_name,
+        name: name || tag_name,
+        body: notes,
+        target_commitish,
+        prerelease,
+        draft,
+        generate_release_notes: !notes
+      };
+      if (!target_commitish) delete releaseBody.target_commitish;
+      if (notes) delete releaseBody.generate_release_notes;
+
+      return json(res, 201, await gh(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases`, s.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(releaseBody)
+      }));
+    }
+
+    return json(res, 404, { error: 'Route not found' });
+  } catch (e) {
+    if (e?.rateLimited) return json(res, 429, { error: 'GitHub API rate limit reached. Please wait and try again.' });
+    return json(res, e.status || 500, { error: e.message || 'Something went wrong' });
+  }
+}

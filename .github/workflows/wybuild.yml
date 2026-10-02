@@ -1,0 +1,386 @@
+# wybuild-workflow-version: 30
+name: WyBuild
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: Build target
+        required: true
+        type: choice
+        options: [auto, apk, aab, web, twa]
+        default: auto
+      build_mode:
+        description: Build mode
+        required: true
+        type: choice
+        options: [debug, release]
+        default: release
+      native_features:
+        description: Native Web-to-App features (server-authorized)
+        required: false
+        type: string
+        default: free
+      web_app_url:
+        description: Deployed HTTPS PWA URL for TWA builds
+        required: false
+        type: string
+        default: ''
+      app_id:
+        description: Android package ID for TWA builds
+        required: false
+        type: string
+        default: com.example.myapp
+      app_name:
+        description: Android app display name
+        required: false
+        type: string
+        default: My App
+      twa_output:
+        description: TWA artifact format
+        required: false
+        type: choice
+        options: [apk, aab]
+        default: apk
+run-name: "WyBuild: ${{ inputs.build_type }} (${{ inputs.build_mode }}) [${{ inputs.native_features }}] on ${{ github.ref_name }}"
+permissions:
+  contents: read
+concurrency:
+  group: wybuild-${{ github.repository }}-${{ github.ref }}-${{ inputs.build_type }}-${{ inputs.build_mode }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f pubspec.yaml ]; then type=flutter
+          elif find . -type f -name gradlew -not -path './.git/*' -not -path '*/node_modules/*' | grep -q .; then type=gradle
+          elif [ -f package.json ]; then
+            if node -e "const p=require('./package.json'); process.exit(p.dependencies?.next || p.devDependencies?.next ? 0 : 1)"; then type=next; else type=node-web; fi
+          elif find . -maxdepth 3 -type f \( -name index.html -o -name '*.html' \) -not -path './.git/*' | grep -q .; then type=vanilla
+          else type=unknown; fi
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+      - name: Validate requested target
+        shell: bash
+        env:
+          REQUESTED: ${{ inputs.build_type }}
+          DETECTED: ${{ steps.detect.outputs.type }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUESTED" = twa ]; then exit 0; fi
+          if [ "$DETECTED" = unknown ]; then echo '::error::Unsupported project'; exit 1; fi
+          if { [ "$DETECTED" = node-web ] || [ "$DETECTED" = vanilla ] || [ "$DETECTED" = next ]; } && { [ "$REQUESTED" = apk ] || [ "$REQUESTED" = aab ]; }; then echo '::error::Web projects are never packaged in a WebView. Deploy your PWA over HTTPS and select the TWA target.'; exit 1; fi
+          if [ "$REQUESTED" = web ] && { [ "$DETECTED" = flutter ] || [ "$DETECTED" = gradle ]; }; then echo '::error::Web target unavailable for native project'; exit 1; fi
+          if [ "$DETECTED" = next ] && [ "$REQUESTED" != web ] && [ "$REQUESTED" != auto ]; then echo '::error::Next.js requires static export for APK/AAB'; exit 1; fi
+      - name: Validate Play release signing prerequisites
+        if: inputs.build_mode == 'release' && (inputs.build_type == 'aab' || (inputs.build_type == 'twa' && inputs.twa_output == 'aab'))
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_STORE_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::A Play-ready AAB requires a persistent upload keystore. Configure all four repository Actions secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD and ANDROID_STORE_PASSWORD. Temporary keys are not used for AAB releases."
+              exit 1
+            fi
+          done
+
+      - name: Set up Java (native Android project)
+        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Set up Java (web wrapper)
+        if: steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2.23.0
+        with:
+          channel: stable
+          cache: true
+      - name: Build Flutter Android
+        if: steps.detect.outputs.type == 'flutter' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto')
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+          if [ '${{ inputs.build_type }}' = aab ]; then flutter build appbundle --release
+          elif [ '${{ inputs.build_type }}' = apk ] && [ '${{ inputs.build_mode }}' = debug ]; then flutter build apk --debug
+          else flutter build apk --release; fi
+      - name: Build existing Gradle Android project
+        if: steps.detect.outputs.type == 'gradle' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto')
+        shell: bash
+        run: |
+          set -euo pipefail
+          wrapper="$(find . -type f -name gradlew -not -path './.git/*' -not -path '*/node_modules/*' | head -n 1)"
+          cd "$(dirname "$wrapper")"; chmod +x ./gradlew
+          if [ '${{ inputs.build_type }}' = aab ]; then ./gradlew bundleRelease --no-daemon --stacktrace
+          elif [ '${{ inputs.build_type }}' = apk ] && [ '${{ inputs.build_mode }}' = debug ]; then ./gradlew assembleDebug --no-daemon --stacktrace
+          else ./gradlew assembleRelease --no-daemon --stacktrace; fi
+      - name: Set up Node.js
+        if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' && 'npm' || '' }}
+      - name: Install Node dependencies
+        if: steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then npm ci; elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile; elif [ -f yarn.lock ]; then corepack enable && yarn install --immutable; else npm install; fi
+      - name: Build static web output
+        if: (steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla') && (inputs.build_type == 'web' || inputs.build_type == 'auto')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p wybuild-output
+          if [ '${{ steps.detect.outputs.type }}' = node-web ] && node -e "const p=require('./package.json'); process.exit(typeof p.scripts?.build === 'string' ? 0 : 1)"; then npm run build; fi
+          if [ -d dist ]; then cp -R dist/. wybuild-output/
+          elif [ -d build ]; then cp -R build/. wybuild-output/
+          elif [ -d out ]; then cp -R out/. wybuild-output/
+          elif [ -f index.html ]; then rsync -a --exclude node_modules --exclude .git --exclude wybuild-output ./ wybuild-output/
+          elif [ -f web/index.html ]; then rsync -a --exclude node_modules --exclude .git --exclude wybuild-output web/ wybuild-output/
+          else echo '::error::No static output found'; exit 1; fi
+          test -f wybuild-output/index.html || { echo '::error::Static output has no index.html'; exit 1; }
+      - name: Set up Java for TWA
+        if: inputs.build_type == 'twa'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Gradle for TWA
+        if: inputs.build_type == 'twa'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Set up Android SDK for TWA
+        if: inputs.build_type == 'twa'
+        uses: android-actions/setup-android@v3
+      - name: Install Android 16 SDK for TWA
+        if: inputs.build_type == 'twa'
+        shell: bash
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+      - name: Validate TWA prerequisites and build TWA
+        if: inputs.build_type == 'twa'
+        shell: bash
+        env:
+          WEB_APP_URL: ${{ inputs.web_app_url }}
+          APP_ID: ${{ inputs.app_id }}
+          APP_NAME: ${{ inputs.app_name }}
+          TWA_OUTPUT: ${{ inputs.twa_output }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import os, re, urllib.request, json
+          from urllib.parse import urlparse
+          url=os.environ.get('WEB_APP_URL','').strip().rstrip('/')
+          app_id=os.environ.get('APP_ID','').strip()
+          parsed_url=urlparse(url)
+          origin=f'{parsed_url.scheme}://{parsed_url.netloc}'
+          if not url.startswith('https://'): raise SystemExit('::error::TWA requires a deployed HTTPS website URL.')
+          app_name=os.environ.get('APP_NAME','').strip()
+          if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+', app_id): raise SystemExit('::error::Invalid Android package ID.')
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}', app_name): raise SystemExit('::error::App name must be 1-40 letters, numbers, spaces, dots, underscores or hyphens.')
+          manifest=None
+          for path in ['/manifest.json','/manifest.webmanifest']:
+              try:
+                  with urllib.request.urlopen(url+path, timeout=15) as r: manifest=json.loads(r.read().decode())
+                  break
+              except Exception: pass
+          if not isinstance(manifest, dict): raise SystemExit('::error::Could not load a valid manifest.json or manifest.webmanifest at the website root.')
+          if not all(os.environ.get(k) for k in ['ANDROID_KEYSTORE_BASE64','ANDROID_KEY_ALIAS','ANDROID_KEY_PASSWORD','ANDROID_STORE_PASSWORD']):
+              raise SystemExit('::error::TWA requires a persistent signing keystore. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD and ANDROID_STORE_PASSWORD to repository Actions secrets.')
+          import subprocess
+          keystore='/tmp/wybuild-twa-signing.jks'
+          with open(keystore,'wb') as f: f.write(__import__('base64').b64decode(os.environ['ANDROID_KEYSTORE_BASE64']))
+          cert=subprocess.run(['keytool','-list','-v','-keystore',keystore,'-storepass',os.environ['ANDROID_STORE_PASSWORD'],'-alias',os.environ['ANDROID_KEY_ALIAS']],capture_output=True,text=True)
+          if cert.returncode: raise SystemExit('::error::Could not read the configured signing certificate. Check the keystore, alias and store password.')
+          match=re.search(r'SHA256:\s*([0-9A-Fa-f:]{32,})',cert.stdout)
+          if not match: raise SystemExit('::error::Could not extract the signing certificate SHA-256 fingerprint.')
+          fingerprint=match.group(1).upper()
+          try:
+              with urllib.request.urlopen(origin+'/.well-known/assetlinks.json', timeout=15) as r: links=json.loads(r.read().decode())
+          except Exception: raise SystemExit('::error::Publish /.well-known/assetlinks.json with your package ID and signing certificate SHA-256 fingerprint before building a verified TWA.')
+          verified=any(item.get('target',{}).get('namespace')=='android_app' and item.get('target',{}).get('package_name')==app_id and 'delegate_permission/common.handle_all_urls' in item.get('relation',[]) and fingerprint in [str(x).upper() for x in item.get('target',{}).get('sha256_cert_fingerprints',[])] for item in links if isinstance(item,dict)) if isinstance(links,list) else False
+          if not verified: raise SystemExit('::error::Digital Asset Links does not match this package ID and signing certificate fingerprint. Update assetlinks.json, then rebuild.')
+          print('PWA manifest, persistent signing key and Digital Asset Links verified.')
+          PYCODE
+          mkdir -p twa-app/app/src/main/java/com/wybuild/twa twa-app/app/src/main/res/values
+          cat > twa-app/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "WyBuildTwa"
+          include(":app")
+          EOF
+          cat > twa-app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.9.1' apply false }
+          EOF
+          cat > twa-app/gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          EOF
+          cat > twa-app/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android { namespace 'com.wybuild.twa'; compileSdk 36; defaultConfig { applicationId System.getenv('APP_ID'); minSdk 23; targetSdk 36; versionCode (System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger(); versionName '1.0.0' } }
+          dependencies { implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0' }
+          EOF
+          cat > twa-app/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <application android:label="__APP_NAME__" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false">
+              <meta-data android:name="asset_statements" android:resource="@string/asset_statements" />
+              <activity android:name="com.google.androidbrowserhelper.trusted.LauncherActivity" android:exported="true" android:label="__APP_NAME__">
+                <meta-data android:name="android.support.customtabs.trusted.DEFAULT_URL" android:value="__WEB_APP_URL__" />
+                <meta-data android:name="android.support.customtabs.trusted.STATUS_BAR_COLOR" android:resource="@color/colorPrimary" />
+                <meta-data android:name="android.support.customtabs.trusted.NAVIGATION_BAR_COLOR" android:resource="@color/navigationColor" />
+                <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > twa-app/app/src/main/res/values/colors.xml <<'EOF'
+          <resources>
+            <color name="colorPrimary">#111827</color>
+            <color name="navigationColor">#111827</color>
+          </resources>
+          EOF
+          cat > twa-app/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+            <string name="asset_statements" translatable="false">[{&quot;include&quot;: &quot;__WEB_ORIGIN__/.well-known/assetlinks.json&quot;}]</string>
+          </resources>
+          EOF
+          python3 - <<'PYCODE'
+          import os, pathlib
+          root=pathlib.Path('twa-app')
+          for p in root.rglob('*'):
+              if p.is_file():
+                  t=p.read_text()
+                  t=t.replace('__APP_NAME__',os.environ['APP_NAME'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'))
+                  t=t.replace('__WEB_APP_URL__',os.environ['WEB_APP_URL'].rstrip('/'))
+                  from urllib.parse import urlparse
+                  parsed=urlparse(os.environ['WEB_APP_URL'])
+                  t=t.replace('__WEB_ORIGIN__', f'{parsed.scheme}://{parsed.netloc}')
+                  p.write_text(t)
+          PYCODE
+          echo "APP_ID=$APP_ID" >> "$GITHUB_ENV"
+          cd twa-app
+          if [ "$TWA_OUTPUT" = aab ]; then gradle bundleRelease --no-daemon --stacktrace; else gradle assembleRelease --no-daemon --stacktrace; fi
+      - name: Sign and verify Android release artifacts
+        if: inputs.build_mode == 'release' && (inputs.build_type == 'apk' || inputs.build_type == 'aab' || inputs.build_type == 'auto' || inputs.build_type == 'twa') && (inputs.build_type == 'twa' || steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYSTORE=/tmp/wybuild-release.jks
+          PERSISTENT=false
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && [ -n "${ANDROID_KEY_ALIAS:-}" ] && [ -n "${ANDROID_KEY_PASSWORD:-}" ] && [ -n "${ANDROID_STORE_PASSWORD:-}" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+            ALIAS="$ANDROID_KEY_ALIAS"; KP="$ANDROID_KEY_PASSWORD"; SP="$ANDROID_STORE_PASSWORD"; PERSISTENT=true
+          else
+            # Temporary keys are acceptable for install/testing APKs only. AAB release builds are blocked above.
+            keytool -genkeypair -noprompt -keystore "$KEYSTORE" -storepass wybuild-temp-store -keypass wybuild-temp-key -alias wybuild -keyalg RSA -keysize 3072 -validity 10000 -dname 'CN=WyBuild Temporary Test Key, O=WyBuild, C=NG'
+            ALIAS=wybuild; KP=wybuild-temp-key; SP=wybuild-temp-store
+          fi
+          EXPECTED_SHA="$(keytool -list -v -keystore "$KEYSTORE" -storepass "$SP" -alias "$ALIAS" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+          while IFS= read -r -d '' apk; do
+            TOOL="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+            if "$TOOL" verify --print-certs "$apk" > /tmp/wybuild-apk-cert.txt 2>&1; then
+              ACTUAL_SHA="$(awk -F': ' '/Signer #1 certificate SHA-256 digest/{print $2; exit}' /tmp/wybuild-apk-cert.txt | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+              if [ -z "$ACTUAL_SHA" ]; then echo '::error::Could not inspect APK signing certificate.'; exit 1; fi
+              if [ "$PERSISTENT" = true ] && [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then echo '::error::APK is already signed with a different certificate than the configured upload key. Align the Gradle release signing config and GitHub Actions secrets.'; exit 1; fi
+              echo "APK already signed; verified certificate $ACTUAL_SHA"
+            else
+              "$TOOL" sign --ks "$KEYSTORE" --ks-key-alias "$ALIAS" --ks-pass "pass:$SP" --key-pass "pass:$KP" "$apk"
+              "$TOOL" verify "$apk"
+            fi
+          done < <(find . -type f -name '*.apk' -path '*/build/outputs/apk/*' -print0)
+          while IFS= read -r -d '' aab; do
+            if jarsigner -verify "$aab" >/dev/null 2>&1; then
+              ACTUAL_SHA="$(keytool -printcert -jarfile "$aab" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+              if [ "$PERSISTENT" != true ] || [ -z "$ACTUAL_SHA" ] || [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+                echo '::error::AAB is already signed with a different or unknown certificate. Configure the same persistent upload key used by your app and rebuild.'; exit 1
+              fi
+            else
+              if [ "$PERSISTENT" != true ]; then echo '::error::AAB must use a persistent upload keystore.'; exit 1; fi
+              jarsigner -keystore "$KEYSTORE" -storepass "$SP" -keypass "$KP" "$aab" "$ALIAS"
+              jarsigner -verify "$aab"
+              SIGNED_SHA="$(keytool -printcert -jarfile "$aab" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+              if [ "$SIGNED_SHA" != "$EXPECTED_SHA" ]; then echo '::error::AAB signing certificate does not match the configured persistent upload key.'; exit 1; fi
+            fi
+          done < <(find . -type f -name '*.aab' -path '*/build/outputs/bundle/*' -print0)
+
+      - name: Build Next.js static web export
+        if: steps.detect.outputs.type == 'next' && (inputs.build_type == 'web' || inputs.build_type == 'auto')
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          mkdir -p wybuild-output
+          if [ -d out ]; then cp -R out/. wybuild-output/; else echo '::error::This Next.js app did not produce a static out/ directory. For a standalone web artifact, configure output: export; for server-rendered apps, deploy it and build a TWA from its HTTPS URL.'; exit 1; fi
+          test -f wybuild-output/index.html || { echo '::error::Next.js static export is missing index.html'; exit 1; }
+      - name: Upload web output
+        if: inputs.build_type == 'web' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'next' || steps.detect.outputs.type == 'node-web' || steps.detect.outputs.type == 'vanilla'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: wybuild-web-${{ github.run_number }}
+          path: 'wybuild-output/*'
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload APK
+        if: inputs.build_type == 'apk' || (inputs.build_type == 'auto' && (steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'gradle')) || (inputs.build_type == 'twa' && inputs.twa_output == 'apk')
+        uses: actions/upload-artifact@v4
+        with:
+          name: wybuild-apk-${{ github.run_number }}
+          path: '**/build/outputs/apk/**/*.apk'
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload AAB
+        if: inputs.build_type == 'aab' || (inputs.build_type == 'twa' && inputs.twa_output == 'aab')
+        uses: actions/upload-artifact@v4
+        with:
+          name: wybuild-aab-${{ github.run_number }}
+          path: '**/build/outputs/bundle/**/*.aab'
+          if-no-files-found: error
+          retention-days: 7
+      - name: Notify WyBuild about build result (FCM)
+        if: always()
+        shell: bash
+        env:
+          NOTIFY_URL: __WYBUILD_NOTIFY_URL__
+          NOTIFY_SECRET: ${{ secrets.WYBUILD_NOTIFY_SECRET }}
+          CONCLUSION: ${{ job.status }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -n "${NOTIFY_SECRET:-}" ] && [ -n "${NOTIFY_URL:-}" ]; then
+            owner="${REPOSITORY%%/*}"
+            repo="${REPOSITORY##*/}"
+            payload="$(python3 -c 'import json,os; print(json.dumps({"owner":os.environ["REPOSITORY"].split("/")[0],"repo":os.environ["REPOSITORY"].split("/")[1],"run_id":os.environ["RUN_ID"],"conclusion":os.environ["CONCLUSION"],"run_url":os.environ["RUN_URL"]}))')"
+            curl --silent --show-error --max-time 8 -X POST "$NOTIFY_URL" -H "Authorization: Bearer $NOTIFY_SECRET" -H 'Content-Type: application/json' --data "$payload" || echo 'WyBuild push notification callback was unavailable; build result remains available in GitHub Actions.'
+          fi
